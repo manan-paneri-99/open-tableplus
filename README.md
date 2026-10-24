@@ -19,6 +19,25 @@ The binaries aren't code-signed yet, so the first launch shows a warning:
 
 Flags: `-port 7777`, `-open=false` (don't launch a browser), `-config DIR`, `-version`.
 
+## Upgrading
+
+Your data isn't stored in the binary, so upgrading means replacing the binary:
+
+1. Stop the app (Ctrl+C).
+2. Unpack the new release and put its binary where the old one was.
+3. Start it and reload the browser tab.
+
+Optionally back up first: `cp -R ~/.config/open-tableplus ~/.config/open-tableplus.bak`.
+
+| Data | Where | Kept across upgrades |
+|---|---|---|
+| Connections and passwords | `~/.config/open-tableplus/connections.json` | yes |
+| Query history (v0.3+) | `~/.config/open-tableplus/history.json` | yes |
+| Access token | `~/.config/open-tableplus/token` | yes, so you stay signed in |
+| Open tabs and editor text | browser storage for `http://127.0.0.1:7777` | yes, if you keep the same port |
+
+Newer versions read older files, and older versions ignore fields they don't know. If a release ever changes the file format, it will convert the files on first start and say so in the release notes.
+
 ## Build from source
 
 ```sh
@@ -38,7 +57,11 @@ go test ./...               # integration tests against it (skipped if it isn't 
 scripts/devdb.sh reset      # wipe and reseed
 ```
 
-Spec and acceptance checks: [docs/v1-plan.md](docs/v1-plan.md).
+Docs:
+- [docs/STATUS.md](docs/STATUS.md): current state, decisions, next steps.
+- [docs/v1-plan.md](docs/v1-plan.md): architecture and API.
+- [docs/v0.3-plan.md](docs/v0.3-plan.md): current release spec.
+- [docs/product-spec.md](docs/product-spec.md): the original vision.
 
 ## Roadmap
 
@@ -47,13 +70,17 @@ Read-only and reliable first, then writes, then reach. App code (excluding tests
 **Shipped**
 - **v0.1:** browse and search Postgres, multiple connections and databases, a read-only SQL box with cancel, and a single binary for macOS, Windows and Linux.
 - **v0.2:** tabs with independent search, filters and results (no tab or filter limits); search runs on Enter.
+- **v0.2.1:** pooled connections are reset between requests, so locks and prepared statements can't leak.
+
+**In review (PR #3)**
+- **v0.3: Get data out.**
+  - Copy a block of cells as TSV.
+  - Streamed CSV export of a table view or a query, with every row and full values.
+  - Query history per connection and database, saved in `history.json`.
+  - Environment label per connection (a red `prod` badge and coloured tabs).
+  - Structure view: columns, indexes and foreign keys.
 
 **Next**
-- **v0.3: Get data out.**
-  - Copy a cell, row or selection as TSV.
-  - CSV export of the current result, and of a whole query streamed from the server.
-  - Query history per connection.
-  - Environment label and color per connection (e.g. a red `prod` badge).
 - **v0.4: Safe editing,** opt-in per connection.
   - Edit, insert and delete rows in tables that have a primary key.
   - Review pending changes before applying.
