@@ -1,7 +1,8 @@
 'use strict';
-// Open TablePlus UI. No framework, no build. Everything the user sees comes
-// from the URL hash (#/conn/db/schema/table or #/conn/db/:sql), so two browser
-// tabs are two independent views.
+// Open TablePlus UI. No framework, no build.
+// Each open table or SQL query is a tab with its own pane (DOM), state and
+// in-flight request, so switching tabs never reloads or loses anything.
+// Open tabs are remembered in localStorage (layout and inputs only, no data).
 
 const $ = (s) => document.querySelector(s);
 
@@ -32,71 +33,52 @@ async function api(method, path, body, signal) {
 
 const enc = encodeURIComponent;
 const fmt = (n) => Number(n).toLocaleString();
-
-const S = {
-  conns: [], conn: null, db: null, dbs: [], tree: [],
-  view: null,                  // { schema, table } or { sql: true }
-  t: null,                     // table view state: { q, filters, sort, desc, page }
-  inflight: null,              // AbortController of the running request
-};
-
-function setStatus(msg, err) {
-  const el = $('#status');
-  el.className = err ? 'err' : '';
-  el.textContent = msg;
-}
+const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
 function errText(e) {
   return [e.message, e.detail && 'Detail: ' + e.detail, e.hint && 'Hint: ' + e.hint, e.code && `(${e.code})`]
     .filter(Boolean).join('\n');
 }
 
-// ---------- routing ----------
+// Sidebar context (which connection/database the tree shows) and open tabs.
+const S = { conns: [], conn: null, db: null, dbs: null, tree: [], ctxSeq: 0, tabs: [], active: null, nextId: 1, sqlCount: 0 };
 
-function parseHash() {
-  const [conn, db, a, b] = location.hash.replace(/^#\/?/, '').split('/').map(decodeURIComponent);
-  return { conn, db, view: a === ':sql' ? { sql: true } : a && b ? { schema: a, table: b } : null };
-}
-
-function go(conn, db, view) {
-  let hash = `#/${enc(conn)}/${enc(db)}`;
-  if (view?.sql) hash += '/:sql';
-  else if (view) hash += `/${enc(view.schema)}/${enc(view.table)}`;
-  if (location.hash === hash) route(); else location.hash = hash;
-}
-
-async function route() {
-  const want = parseHash();
-  const conn = S.conns.find((c) => c.id === want.conn) || S.conns[0];
-  if (!conn) { renderConnSelect(); openDialog(null); return; }
-  try {
-    if (conn.id !== S.conn?.id) {
-      S.conn = conn; S.db = null;
-      renderConnSelect();
-      S.dbs = await api('GET', `/c/${enc(conn.id)}/dbs`);
-    }
-    const db = S.dbs.includes(want.db) ? want.db : S.dbs.includes(conn.database) ? conn.database : S.dbs[0];
-    if (db !== S.db) {
-      S.db = db; S.tree = [];
-      renderDbSelect();
-      S.tree = await api('GET', `/c/${enc(conn.id)}/${enc(db)}/tree`);
-    }
-  } catch (e) {
-    S.dbs = S.dbs || []; renderDbSelect(); renderTree();
-    setStatus(`Can't open ${conn.name}: ${errText(e)}`, true);
-    return;
-  }
-  // Normalise the URL to what we actually opened (e.g. the default database).
-  const view = want.db === S.db ? want.view : null;
-  let hash = `#/${enc(conn.id)}/${enc(S.db)}`;
-  if (view?.sql) hash += '/:sql';
-  else if (view) hash += `/${enc(view.schema)}/${enc(view.table)}`;
-  if (location.hash !== hash) history.replaceState(null, '', hash);
-  show(view);
-  renderTree();
-}
+const connName = (id) => S.conns.find((c) => c.id === id)?.name ?? '?';
+const activeTab = () => S.tabs.find((t) => t.id === S.active);
+const sameTable = (a, b) => a?.kind === 'table' && a.conn === b.conn && a.db === b.db && a.schema === b.schema && a.table === b.table;
 
 // ---------- sidebar ----------
+
+// selectContext points the sidebar at a connection/database and loads its tree.
+// Later calls win: a slow earlier load never overwrites a newer one.
+async function selectContext(connId, db) {
+  const seq = ++S.ctxSeq;
+  const conn = S.conns.find((c) => c.id === connId) || S.conns[0];
+  if (!conn) { renderConnSelect(); openDialog(null); return; }
+  sideMsg('');
+  try {
+    if (conn.id !== S.conn?.id || !S.dbs) {
+      S.conn = conn; S.db = null; S.dbs = null; S.tree = [];
+      renderConnSelect(); renderDbSelect(); renderTree();
+      const dbs = await api('GET', `/c/${enc(conn.id)}/dbs`);
+      if (seq !== S.ctxSeq) return;
+      S.dbs = dbs;
+    }
+    const want = S.dbs.includes(db) ? db : S.dbs.includes(conn.database) ? conn.database : S.dbs[0];
+    if (want !== S.db) {
+      S.db = want; S.tree = [];
+      renderDbSelect(); renderTree();
+      const tree = await api('GET', `/c/${enc(conn.id)}/${enc(want)}/tree`);
+      if (seq !== S.ctxSeq) return;
+      S.tree = tree;
+    }
+  } catch (e) {
+    if (seq === S.ctxSeq) sideMsg(`Can't open ${conn.name}: ${errText(e)}`);
+  }
+  renderDbSelect(); renderTree();
+}
+
+function sideMsg(msg) { $('#sideMsg').textContent = msg; $('#sideMsg').hidden = !msg; }
 
 function renderConnSelect() {
   $('#conn').replaceChildren(...S.conns.map((c) => h('option', { value: c.id, selected: c.id === S.conn?.id }, c.name)));
@@ -107,8 +89,6 @@ function renderDbSelect() {
   $('#db').replaceChildren(...(S.dbs || []).map((d) => h('option', { value: d, selected: d === S.db }, d)));
 }
 
-const kindLabel = { r: 'table', p: 'table', v: 'view', m: 'matview', f: 'foreign' };
-
 function renderTree() {
   const f = $('#filterTables').value.trim().toLowerCase();
   const bySchema = new Map();
@@ -117,81 +97,175 @@ function renderTree() {
     if (!bySchema.has(t.schema)) bySchema.set(t.schema, []);
     bySchema.get(t.schema).push(t);
   }
-  const v = S.view;
+  const spec = (t) => ({ kind: 'table', conn: S.conn.id, db: S.db, schema: t.schema, table: t.name });
   $('#tree').replaceChildren(...[...bySchema].map(([schema, rels]) =>
     h('details', { open: true },
       h('summary', {}, schema),
-      rels.map((t) => h('a', {
-        href: `#/${enc(S.conn.id)}/${enc(S.db)}/${enc(t.schema)}/${enc(t.name)}`,
-        class: v && v.schema === t.schema && v.table === t.name ? 'on' : null,
-        title: kindLabel[t.kind],
+      rels.map((t) => h('button', {
+        class: [sameTable(activeTab(), spec(t)) && 'on', S.tabs.some((x) => sameTable(x, spec(t))) && 'open'].filter(Boolean).join(' ') || null,
+        onclick: () => openTab(spec(t)),
       }, h('span', { class: 'n' }, t.name), h('small', {}, t.kind === 'v' ? 'view' : t.approxRows > 0 ? '~' + fmt(t.approxRows) : '')))
     )));
-  if (!bySchema.size) $('#tree').append(h('p', { class: 'muted' }, S.tree.length ? 'No match.' : ''));
+  if (!bySchema.size && S.tree.length) $('#tree').append(h('p', {}, 'No match.'));
 }
 
-// ---------- main pane ----------
+// ---------- tabs ----------
 
-function show(view) {
-  S.inflight?.abort();
-  const same = view && S.view && view.schema === S.view.schema && view.table === S.view.table && !view.sql;
-  S.view = view;
-  $('#tablePane').hidden = !view || view.sql;
-  $('#sqlPane').hidden = !view?.sql;
-  $('#cell').hidden = true;
-  if (!view) {
-    $('#title').textContent = `${S.conn.name} / ${S.db}`;
-    $('#grid').replaceChildren();
-    setStatus(S.tree.length ? 'Pick a table, or open the SQL query.' : 'No tables in this database.');
-    return;
+// openTab focuses an existing tab for the same table, or creates a new one.
+function openTab(spec, { focus = true } = {}) {
+  if (spec.kind === 'table') {
+    const existing = S.tabs.find((t) => sameTable(t, spec));
+    if (existing) { if (focus) activate(existing); return existing; }
   }
-  if (view.sql) {
-    $('#title').textContent = `SQL — ${S.conn.name} / ${S.db}`;
-    $('#grid').replaceChildren();
-    setStatus('Read-only: every statement runs inside a READ ONLY transaction.');
-    $('#sql').focus();
-    return;
-  }
-  $('#title').textContent = `${view.schema}.${view.table}`;
-  if (!same) {
-    S.t = { q: '', filters: [], sort: '', desc: false, page: 0, columns: [] };
-    $('#q').value = '';
-    renderFilters();
-  }
-  loadRows();
+  const tab = {
+    id: S.nextId++, kind: spec.kind, conn: spec.conn, db: spec.db, schema: spec.schema, table: spec.table,
+    t: { q: '', filters: [], sort: '', desc: false, page: 0, ...spec.t, columns: [] },
+    sql: spec.sql ?? '', n: spec.kind === 'sql' ? (spec.n || ++S.sqlCount) : 0,
+    loaded: false, inflight: null, el: {},
+  };
+  S.sqlCount = Math.max(S.sqlCount, tab.n);
+  (tab.kind === 'table' ? buildTablePane : buildSqlPane)(tab);
+  tab.el.pane.hidden = true;
+  $('#panes').append(tab.el.pane);
+  S.tabs.push(tab);
+  if (focus) activate(tab); else renderTabs();
+  saveTabs();
+  return tab;
 }
 
-async function loadRows() {
-  const v = S.view, t = S.t;
-  S.inflight?.abort();
-  const ctl = S.inflight = new AbortController();
-  $('#search').classList.remove('dirty'); // whatever is in the boxes is what's being loaded
-  setStatus('Loading…');
+function activate(tab) {
+  S.active = tab.id;
+  for (const t of S.tabs) t.el.pane.hidden = t !== tab;
+  $('#empty').hidden = true;
+  renderTabs();
+  if (tab.conn !== S.conn?.id || tab.db !== S.db) selectContext(tab.conn, tab.db); else renderTree();
+  if (!tab.loaded) {
+    tab.loaded = true;
+    if (tab.kind === 'table') loadRows(tab);
+  }
+  if (tab.kind === 'sql') tab.el.sql.focus();
+  saveTabs();
+}
+
+function closeTab(tab) {
+  tab.inflight?.abort();
+  tab.el.pane.remove();
+  const i = S.tabs.indexOf(tab);
+  S.tabs.splice(i, 1);
+  if (S.active === tab.id) {
+    const next = S.tabs[i] || S.tabs[i - 1];
+    if (next) activate(next);
+    else { S.active = null; $('#empty').hidden = false; renderTabs(); renderTree(); }
+  } else renderTabs();
+  saveTabs();
+}
+
+const tabLabel = (t) => t.kind === 'sql' ? `SQL ${t.n}` : t.table;
+
+function renderTabs() {
+  // Show the database next to the name only when tabs span more than one.
+  const many = new Set(S.tabs.map((t) => t.conn + '/' + t.db)).size > 1;
+  $('#tabs').replaceChildren(...S.tabs.map((t) => h('div', {
+    class: 'tab' + (t.id === S.active ? ' on' : ''), role: 'tab', 'aria-selected': String(t.id === S.active), title: `${connName(t.conn)} / ${t.db} / ` + (t.kind === 'sql' ? 'SQL' : `${t.schema}.${t.table}`),
+    onclick: () => activate(t),
+    onauxclick: (e) => { if (e.button === 1) { e.preventDefault(); closeTab(t); } },
+  },
+    h('span', { class: 'n' }, tabLabel(t)),
+    many ? h('small', {}, t.db) : null,
+    h('button', { class: 'x', 'aria-label': `Close ${tabLabel(t)}`, onclick: (e) => { e.stopPropagation(); closeTab(t); } }, '×'),
+  )));
+  $('#tabs').querySelector('.on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+
+// Remembered across reloads: which tabs are open and their inputs. Never results.
+const STORE = 'open-tableplus.tabs';
+const saveTabs = debounce(() => {
   try {
-    const res = await api('POST', `/c/${enc(S.conn.id)}/${enc(S.db)}/rows`, {
-      schema: v.schema, table: v.table, q: t.q, sort: t.sort, desc: t.desc, page: t.page,
+    localStorage.setItem(STORE, JSON.stringify({
+      active: S.tabs.findIndex((t) => t.id === S.active),
+      tabs: S.tabs.map((t) => ({
+        kind: t.kind, conn: t.conn, db: t.db, schema: t.schema, table: t.table, sql: t.sql, n: t.n,
+        t: { q: t.t.q, filters: t.t.filters, sort: t.t.sort, desc: t.t.desc, page: t.t.page },
+      })),
+    }));
+  } catch { /* storage unavailable: tabs just won't survive a reload */ }
+}, 300);
+
+function restoreTabs() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(STORE) || 'null'); } catch { saved = null; }
+  if (!saved?.tabs?.length) return null;
+  const tabs = saved.tabs.filter((s) => S.conns.some((c) => c.id === s.conn)).map((s) => openTab(s, { focus: false }));
+  return tabs[saved.active] || tabs[0] || null;
+}
+
+// ---------- table tabs ----------
+
+function buildTablePane(tab) {
+  const e = tab.el;
+  const pending = () => e.search.classList.add('dirty'); // edits wait for Enter / Search
+  const onEnter = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); apply(tab); } };
+  e.pending = pending; e.onEnter = onEnter;
+  e.q = h('input', {
+    type: 'search', class: 'q', placeholder: 'Search all columns… (Enter)', 'aria-label': 'Search all columns', value: tab.t.q,
+    oninput: (ev) => { tab.t.q = ev.target.value; pending(); saveTabs(); }, onkeydown: onEnter,
+  });
+  e.search = h('button', { title: 'Run search (Enter)', onclick: () => apply(tab) }, 'Search');
+  e.prev = h('button', { 'aria-label': 'Previous page', onclick: () => { tab.t.page--; loadRows(tab); } }, '‹');
+  e.next = h('button', { 'aria-label': 'Next page', onclick: () => { tab.t.page++; loadRows(tab); } }, '›');
+  e.pageInfo = h('span');
+  e.filters = h('div', { class: 'filters' });
+  e.status = h('div', { class: 'status', role: 'status' });
+  e.grid = h('div', { class: 'grid' });
+  e.cell = h('pre', { class: 'cell', hidden: true });
+  e.pane = h('section', { class: 'pane' },
+    h('div', { class: 'row' }, e.q,
+      h('button', { onclick: () => addFilter(tab) }, '+ Filter'), e.search,
+      h('span', { class: 'grow' }), e.prev, e.pageInfo, e.next),
+    e.filters, e.status, e.grid, e.cell);
+}
+
+function setStatus(tab, msg, err) {
+  tab.el.status.className = 'status' + (err ? ' err' : '');
+  tab.el.status.textContent = msg;
+}
+
+function apply(tab) { tab.t.page = 0; loadRows(tab); }
+
+async function loadRows(tab) {
+  const t = tab.t;
+  tab.inflight?.abort();
+  const ctl = tab.inflight = new AbortController();
+  tab.el.search.classList.remove('dirty'); // whatever is in the boxes is what's being loaded
+  setStatus(tab, 'Loading…');
+  saveTabs();
+  try {
+    const res = await api('POST', `/c/${enc(tab.conn)}/${enc(tab.db)}/rows`, {
+      schema: tab.schema, table: tab.table, q: t.q, sort: t.sort, desc: t.desc, page: t.page,
       filters: t.filters.filter((f) => f.col && (f.op.startsWith('is') || f.val !== '')),
     }, ctl.signal);
     const firstLoad = !t.columns.length;
     t.columns = res.columns;
-    if (firstLoad) renderFilters();
-    renderGrid(res, true);
+    if (firstLoad) renderFilters(tab);
+    renderGrid(tab, res, true);
     const from = t.page * 100 + 1, to = t.page * 100 + res.rows.length;
-    $('#pageInfo').textContent = res.rows.length
+    tab.el.pageInfo.textContent = res.rows.length
       ? `${fmt(from)}–${fmt(to)}${res.approxTotal != null ? ' of ~' + fmt(res.approxTotal) : res.more ? '+' : ''}`
       : 'no rows';
-    $('#prev').disabled = t.page === 0;
-    $('#next').disabled = !res.more;
-    setStatus(`${res.ms} ms`);
+    tab.el.prev.disabled = t.page === 0;
+    tab.el.next.disabled = !res.more;
+    setStatus(tab, `${res.ms} ms`);
   } catch (e) {
-    if (e.name !== 'AbortError') setStatus(errText(e), true);
+    if (e.name !== 'AbortError') setStatus(tab, errText(e), true);
+  } finally {
+    if (tab.inflight === ctl) tab.inflight = null;
   }
 }
 
 const numeric = /^(smallint|integer|bigint|numeric|real|double precision|money|oid)\b/;
 
-function renderGrid(res, sortable) {
-  const t = S.t;
+function renderGrid(tab, res, sortable) {
+  const t = tab.t;
   const cut = new Set((res.cut || []).map(([r, c]) => r + ',' + c));
   const num = res.columns.map((c) => numeric.test(c.type));
   const head = h('tr', {}, res.columns.map((c) => h('th', {
@@ -199,95 +273,99 @@ function renderGrid(res, sortable) {
     title: sortable ? 'Sort' : null,
     onclick: sortable ? () => {
       if (t.sort === c.name) t.desc = !t.desc; else { t.sort = c.name; t.desc = false; }
-      t.page = 0; loadRows();
+      t.page = 0; loadRows(tab);
     } : null,
   }, c.name + (c.pk ? ' 🔑' : '') + (sortable && t.sort === c.name ? (t.desc ? ' ↓' : ' ↑') : ''), h('small', {}, c.type))));
   const body = res.rows.map((row, r) => h('tr', {}, row.map((v, i) => h('td', {
     class: [v === null && 'null', num[i] && 'num', cut.has(r + ',' + i) && 'cut'].filter(Boolean).join(' ') || null,
-    onclick: (e) => showCell(e.currentTarget, res.columns[i], v, cut.has(r + ',' + i)),
+    onclick: (e) => showCell(tab, e.currentTarget, res.columns[i], v, cut.has(r + ',' + i)),
   }, v === null ? 'NULL' : v.length > 300 ? v.slice(0, 300) : v))));
-  $('#grid').replaceChildren(h('table', {}, h('thead', {}, head), h('tbody', {}, body)));
+  tab.el.grid.replaceChildren(h('table', {}, h('thead', {}, head), h('tbody', {}, body)));
+  tab.el.grid.scrollTo(0, 0);
+  tab.el.cell.hidden = true;
 }
 
-function showCell(td, col, v, wasCut) {
-  document.querySelectorAll('td.on').forEach((x) => x.classList.remove('on'));
+function showCell(tab, td, col, v, wasCut) {
+  tab.el.grid.querySelectorAll('td.on').forEach((x) => x.classList.remove('on'));
   td.classList.add('on');
-  const el = $('#cell');
-  el.hidden = false;
-  el.textContent = `${col.name} (${col.type})${wasCut ? ' — first 10 KB only' : ''}\n\n` + (v === null ? 'NULL' : v === '' ? "'' (empty string)" : v);
+  tab.el.cell.hidden = false;
+  tab.el.cell.textContent = `${col.name} (${col.type})${wasCut ? ' — first 10 KB only' : ''}\n\n` + (v === null ? 'NULL' : v === '' ? "'' (empty string)" : v);
 }
-
-// ---------- filters ----------
 
 const ops = ['contains', '=', '!=', '<', '<=', '>', '>=', 'is null', 'is not null'];
-// Search and filter edits are pending until Enter or the Search button.
-function apply() { S.t.page = 0; loadRows(); }
-function edited() { $('#search').classList.add('dirty'); }
-const onEnter = (e) => { if (e.key === 'Enter') { e.preventDefault(); apply(); } };
 
-function renderFilters() {
-  const t = S.t;
-  $('#filters').replaceChildren(...t.filters.map((f, i) => h('div', { class: 'row' },
-    h('select', { 'aria-label': 'Column', onchange: (e) => { f.col = e.target.value; edited(); } },
+function renderFilters(tab) {
+  const t = tab.t, e = tab.el;
+  const changed = () => { e.pending(); saveTabs(); };
+  e.filters.replaceChildren(...t.filters.map((f, i) => h('div', { class: 'row' },
+    h('select', { 'aria-label': 'Column', onchange: (ev) => { f.col = ev.target.value; changed(); } },
       t.columns.map((c) => h('option', { value: c.name, selected: c.name === f.col }, c.name))),
-    h('select', { 'aria-label': 'Operator', onchange: (e) => { f.op = e.target.value; renderFilters(); edited(); } },
+    h('select', { 'aria-label': 'Operator', onchange: (ev) => { f.op = ev.target.value; renderFilters(tab); changed(); } },
       ops.map((o) => h('option', { selected: o === f.op }, o))),
-    f.op.startsWith('is') ? null : h('input', { 'aria-label': 'Value', value: f.val, oninput: (e) => { f.val = e.target.value; edited(); }, onkeydown: onEnter }),
-    h('button', { 'aria-label': 'Remove filter', onclick: () => { t.filters.splice(i, 1); renderFilters(); edited(); } }, '×'),
+    f.op.startsWith('is') ? null : h('input', { 'aria-label': 'Value', value: f.val, oninput: (ev) => { f.val = ev.target.value; changed(); }, onkeydown: e.onEnter }),
+    h('button', { 'aria-label': 'Remove filter', onclick: () => { t.filters.splice(i, 1); renderFilters(tab); changed(); } }, '×'),
   )));
 }
 
-$('#addFilter').onclick = () => {
-  if (!S.t.columns.length) return;
-  S.t.filters.push({ col: S.t.columns[0].name, op: 'contains', val: '' });
-  renderFilters();
-  $('#filters').lastElementChild.querySelector('input')?.focus();
-};
-$('#q').oninput = (e) => { S.t.q = e.target.value; edited(); };
-$('#q').onkeydown = onEnter;
-$('#search').onclick = apply;
-$('#prev').onclick = () => { S.t.page--; loadRows(); };
-$('#next').onclick = () => { S.t.page++; loadRows(); };
+function addFilter(tab) {
+  if (!tab.t.columns.length) return;
+  tab.t.filters.push({ col: tab.t.columns[0].name, op: 'contains', val: '' });
+  renderFilters(tab);
+  tab.el.filters.lastElementChild.querySelector('input')?.focus();
+}
 
-// ---------- SQL ----------
+// ---------- SQL tabs ----------
 
-async function runSQL() {
-  const ta = $('#sql');
+function buildSqlPane(tab) {
+  const e = tab.el;
+  e.sql = h('textarea', {
+    class: 'sql', spellcheck: 'false', 'aria-label': 'SQL',
+    placeholder: 'SELECT …   (⌘/Ctrl+Enter runs; runs the selection if there is one)',
+    oninput: (ev) => { tab.sql = ev.target.value; saveTabs(); },
+    onkeydown: (ev) => { if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) { ev.preventDefault(); runSQL(tab); } },
+  });
+  e.sql.value = tab.sql;
+  e.run = h('button', { onclick: () => runSQL(tab) }, 'Run');
+  e.cancel = h('button', { disabled: true, onclick: () => tab.inflight?.abort() }, 'Cancel');
+  e.status = h('div', { class: 'status', role: 'status' }, 'Read-only: every statement runs inside a READ ONLY transaction.');
+  e.grid = h('div', { class: 'grid' });
+  e.cell = h('pre', { class: 'cell', hidden: true });
+  e.pane = h('section', { class: 'pane' }, e.sql, h('div', { class: 'row' }, e.run, e.cancel), e.status, e.grid, e.cell);
+}
+
+async function runSQL(tab) {
+  const ta = tab.el.sql;
   const selected = ta.selectionStart !== ta.selectionEnd;
   const offset = selected ? ta.selectionStart : 0;
   const sql = selected ? ta.value.slice(ta.selectionStart, ta.selectionEnd) : ta.value;
   if (!sql.trim()) return;
-  S.inflight?.abort();
-  const ctl = S.inflight = new AbortController();
+  tab.inflight?.abort();
+  const ctl = tab.inflight = new AbortController();
   const started = Date.now();
-  const tick = setInterval(() => setStatus(`Running… ${((Date.now() - started) / 1000).toFixed(1)} s`), 100);
-  $('#run').disabled = true; $('#cancel').disabled = false;
+  const tick = setInterval(() => setStatus(tab, `Running… ${((Date.now() - started) / 1000).toFixed(1)} s`), 100);
+  tab.el.run.disabled = true; tab.el.cancel.disabled = false;
   try {
-    const res = await api('POST', `/c/${enc(S.conn.id)}/${enc(S.db)}/sql`, { sql }, ctl.signal);
-    renderGrid(res, false);
-    setStatus(`${res.tag}${res.more ? ` — first ${res.rows.length} rows shown` : ''} · ${res.ms} ms`);
+    const res = await api('POST', `/c/${enc(tab.conn)}/${enc(tab.db)}/sql`, { sql }, ctl.signal);
+    renderGrid(tab, res, false);
+    setStatus(tab, `${res.tag}${res.more ? ` — first ${res.rows.length} rows shown` : ''} · ${res.ms} ms`);
   } catch (e) {
-    if (e.name === 'AbortError') setStatus('Cancelled.');
+    if (e.name === 'AbortError') setStatus(tab, 'Cancelled.');
     else {
-      setStatus(errText(e) + (e.position ? `\nAt character ${e.position}.` : ''), true);
-      if (e.position) { const p = offset + e.position - 1; ta.focus(); ta.setSelectionRange(p, p + 1); }
+      setStatus(tab, errText(e) + (e.position ? `\nAt character ${e.position}.` : ''), true);
+      if (e.position && S.active === tab.id) { const p = offset + e.position - 1; ta.focus(); ta.setSelectionRange(p, p + 1); }
     }
   } finally {
     clearInterval(tick);
-    if (S.inflight === ctl) S.inflight = null;
-    $('#run').disabled = false; $('#cancel').disabled = true;
+    if (tab.inflight === ctl) tab.inflight = null;
+    tab.el.run.disabled = false; tab.el.cancel.disabled = true;
   }
 }
 
-$('#run').onclick = runSQL;
-$('#cancel').onclick = () => S.inflight?.abort();
-$('#sql').onkeydown = (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); runSQL(); } };
-$('#sqlBtn').onclick = () => S.conn && go(S.conn.id, S.db, { sql: true });
-
 // ---------- connections ----------
 
-$('#conn').onchange = (e) => go(e.target.value, '', null);
-$('#db').onchange = (e) => go(S.conn.id, e.target.value, null);
+$('#sqlBtn').onclick = () => S.conn && S.db && openTab({ kind: 'sql', conn: S.conn.id, db: S.db });
+$('#conn').onchange = (e) => selectContext(e.target.value, '');
+$('#db').onchange = (e) => selectContext(S.conn.id, e.target.value);
 $('#filterTables').oninput = renderTree;
 $('#newConn').onclick = () => openDialog(null);
 $('#editConn').onclick = () => openDialog(S.conn);
@@ -328,26 +406,31 @@ $('#dlgSave').onclick = async () => {
     S.conns = await api('GET', '/conns');
     S.conn = null; // force reload of dbs/tree with the new settings
     $('#connDlg').close();
-    go(saved.id, '', null);
+    renderTabs(); // names may have changed
+    selectContext(saved.id, '');
   } catch (e) { dlgMsg(errText(e), true); }
 };
 
 $('#dlgDelete').onclick = async () => {
-  if (!editing || !confirm(`Delete connection "${editing.name}"?`)) return;
+  if (!editing || !confirm(`Delete connection "${editing.name}"? Its open tabs will close.`)) return;
   try {
-    await api('DELETE', `/conns/${enc(editing.id)}`);
+    const id = editing.id;
+    await api('DELETE', `/conns/${enc(id)}`);
     S.conns = await api('GET', '/conns');
     S.conn = null;
     $('#connDlg').close();
-    if (S.conns[0]) go(S.conns[0].id, '', null); else { location.hash = ''; route(); }
+    for (const t of S.tabs.filter((t) => t.conn === id)) closeTab(t);
+    selectContext(activeTab()?.conn ?? S.conns[0]?.id, activeTab()?.db ?? '');
   } catch (e) { dlgMsg(errText(e), true); }
 };
 
 // ---------- start ----------
 
-window.addEventListener('hashchange', route);
 (async () => {
   try { S.conns = await api('GET', '/conns'); }
-  catch (e) { setStatus(errText(e), true); return; }
-  route();
+  catch (e) { sideMsg(errText(e)); return; }
+  renderConnSelect();
+  if (!S.conns.length) { openDialog(null); return; }
+  const restored = restoreTabs();
+  if (restored) activate(restored); else selectContext(S.conns[0].id, '');
 })();

@@ -44,7 +44,6 @@ func main() {
 		log.Fatal(err)
 	}
 	app := NewApp(store)
-	defer app.pools.CloseAll()
 
 	addr := fmt.Sprintf("127.0.0.1:%d", *port)
 	ln, err := net.Listen("tcp", addr)

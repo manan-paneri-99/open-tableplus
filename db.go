@@ -51,9 +51,6 @@ func (p *Pools) Get(c Conn, db string) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, err
 	}
-	if p.m == nil {
-		p.m = map[string]*pgxpool.Pool{}
-	}
 	p.m[key] = pool
 	return pool, nil
 }
@@ -67,15 +64,6 @@ func (p *Pools) Drop(connID string) {
 			delete(p.m, key)
 			go pool.Close() // waits for in-flight queries; don't hold the lock
 		}
-	}
-}
-
-func (p *Pools) CloseAll() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for key, pool := range p.m {
-		delete(p.m, key)
-		pool.Close()
 	}
 }
 
@@ -107,10 +95,9 @@ func tuneConnConfig(cc *pgx.ConnConfig) {
 
 // Column describes a result column. Type is Postgres's own spelling (format_type).
 type Column struct {
-	Name    string `json:"name"`
-	Type    string `json:"type"`
-	NotNull bool   `json:"notNull,omitempty"`
-	PK      bool   `json:"pk,omitempty"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+	PK   bool   `json:"pk,omitempty"`
 }
 
 // Result carries every value as the exact text Postgres sent, or null.
@@ -222,11 +209,8 @@ func describe(ctx context.Context, pc *pgconn.PgConn, fds []pgconn.FieldDescript
 		return err
 	}
 	res.Columns = make([]Column, len(fds))
-	for i, fd := range fds {
-		res.Columns[i] = Column{Name: fd.Name, Type: "unknown"}
-		if i < len(types.Rows) && types.Rows[i][0] != nil {
-			res.Columns[i].Type = *types.Rows[i][0]
-		}
+	for i, fd := range fds { // unnest of equal-length arrays: exactly one row per column
+		res.Columns[i] = Column{Name: fd.Name, Type: *types.Rows[i][0]}
 	}
 	return nil
 }
@@ -346,8 +330,8 @@ func Rows(ctx context.Context, pool *pgxpool.Pool, req RowsReq) (*Result, error)
 	err := readOnly(ctx, pool, func(pc *pgconn.PgConn) error {
 		var meta Result
 		err := query(ctx, pc, `
-			SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull::text,
-			       COALESCE(a.attnum = ANY(i.indkey), false)::text, c.reltuples::bigint, c.relkind::text
+			SELECT a.attname, format_type(a.atttypid, a.atttypmod),
+			       COALESCE(a.attnum = ANY(i.indkey), false)::text, c.reltuples::bigint
 			FROM pg_class c
 			JOIN pg_namespace n ON n.oid = c.relnamespace
 			JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
@@ -364,15 +348,14 @@ func Rows(ctx context.Context, pool *pgxpool.Pool, req RowsReq) (*Result, error)
 		byName := map[string]Column{}
 		var names, pks []string
 		for i, r := range meta.Rows {
-			cols[i] = Column{Name: *r[0], Type: *r[1], NotNull: *r[2] == "true", PK: *r[3] == "true"}
+			cols[i] = Column{Name: *r[0], Type: *r[1], PK: *r[2] == "true"}
 			byName[cols[i].Name] = cols[i]
 			names = append(names, ident(cols[i].Name))
 			if cols[i].PK {
 				pks = append(pks, ident(cols[i].Name))
 			}
 		}
-		total, _ := strconv.ParseInt(*meta.Rows[0][4], 10, 64)
-		kind := *meta.Rows[0][5]
+		total, _ := strconv.ParseInt(*meta.Rows[0][3], 10, 64)
 
 		var where, args []string
 		arg := func(v string) string { args = append(args, v); return "$" + strconv.Itoa(len(args)) }
@@ -435,7 +418,7 @@ func Rows(ctx context.Context, pool *pgxpool.Pool, req RowsReq) (*Result, error)
 		if err := query(ctx, pc, sql, args, pageSize, res); err != nil {
 			return err
 		}
-		if len(where) == 0 && total >= 0 && kind != "v" {
+		if len(where) == 0 && total > 0 { // views and never-analyzed tables have no estimate
 			res.Total = &total
 		}
 		return nil

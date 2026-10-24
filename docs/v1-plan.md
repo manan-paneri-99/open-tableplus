@@ -18,10 +18,10 @@ One local Go binary that serves a web UI for **reading and searching multiple Po
    - **Column filters**: `=, !=, <, <=, >, >=, contains, is null, is not null`, AND'd together.
 5. SQL box: run one statement and see the first 500 rows or the real Postgres error (message, detail, hint, position). Cancel.
 6. Exact values: `NULL` and `''` stay different, and int8, numeric, timestamptz, json and bytea show exactly what `psql` shows.
-7. The URL hash holds the current view (`#conn/db/schema.table`), so two browser tabs give two databases side by side.
+7. **Tabs:** each table or SQL query opens in its own tab, with its own search, filters, page, results and running request. Clicking a table that's already open switches to its tab. Tabs can mix connections and databases. The open tabs and their inputs (not results) survive a reload via localStorage.
 
 **Out (until v1 is boringly reliable)**
-Editing, CSV export, history, in-app tabs, syntax highlighting, keychain, WebSockets, virtualized grid, SSH, TLS client certs, other engines, desktop wrapper.
+Editing, CSV export, history, syntax highlighting, keychain, WebSockets, virtualized grid, SSH, TLS client certs, other engines, desktop wrapper.
 
 ## 3. Architecture
 
