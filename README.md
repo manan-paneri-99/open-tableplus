@@ -39,3 +39,31 @@ scripts/devdb.sh reset      # wipe and reseed
 ```
 
 Spec and acceptance checks: [docs/v1-plan.md](docs/v1-plan.md).
+
+## Roadmap
+
+Read-only and reliable first, then writes, then reach. App code (excluding tests) stays under 2,000 lines through v0.5. Each release ends with an audit that removes code that isn't earning its place.
+
+**Shipped**
+- **v0.1:** browse and search Postgres, multiple connections and databases, a read-only SQL box with cancel, and a single binary for macOS, Windows and Linux.
+- **v0.2:** tabs with independent search, filters and results (no tab or filter limits); search runs on Enter.
+
+**Next**
+- **v0.3: Get data out.**
+  - Copy a cell, row or selection as TSV.
+  - CSV export of the current result, and of a whole query streamed from the server.
+  - Query history per connection.
+  - Environment label and color per connection (e.g. a red `prod` badge).
+- **v0.4: Safe editing,** opt-in per connection.
+  - Edit, insert and delete rows in tables that have a primary key.
+  - Review pending changes before applying.
+  - Apply in one transaction with conflict detection.
+  - Extra confirmation on `prod`.
+- **v0.5: Reach real servers.**
+  - SSH tunnels through a bastion host.
+  - TLS CA and client certificates.
+  - Reconnect behaviour covered by tests.
+
+**Later:** MySQL and SQLite (the API and UI are already engine-neutral; Postgres code lives in `db.go`), signed and notarized binaries plus Homebrew/winget, SQL syntax highlighting, ER diagrams.
+
+**Not planned:** hosted or multi-user mode, AI features.

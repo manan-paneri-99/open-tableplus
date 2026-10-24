@@ -75,6 +75,15 @@ func poolConfig(c Conn, db string) (*pgxpool.Config, error) {
 	cfg.MaxConns = poolMaxConns
 	cfg.MaxConnIdleTime = time.Minute
 	cfg.HealthCheckPeriod = 30 * time.Second
+	// Rollback undoes most of what user SQL can do, but not session-level
+	// advisory locks or PREPAREd statements. Reset the session before reuse;
+	// connection-time settings (statement_timeout…) survive DISCARD ALL.
+	cfg.AfterRelease = func(c *pgx.Conn) bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := c.PgConn().Exec(ctx, "DISCARD ALL").ReadAll()
+		return err == nil // false: the pool destroys the connection
+	}
 	tuneConnConfig(cfg.ConnConfig)
 	return cfg, nil
 }

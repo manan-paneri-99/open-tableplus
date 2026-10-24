@@ -36,7 +36,7 @@ browser ──HTTP/JSON──▶ open-tableplus (127.0.0.1:7777, single binary, 
 - **State:** `~/.config/open-tableplus/` holds `connections.json` and `token` (both `0600`, written atomically). Nothing else, so restarting is free.
 - **Infra:** none. `go build && ./open-tableplus`. Dev/test Postgres is a throwaway `initdb` cluster on port 55432 (`scripts/devdb.sh`). It never touches your own databases.
 
-Budget: **< 1,500 lines** (Go ~600, UI ~600, tests ~300).
+Budget: **< 1,500 lines** of app code for v1. From v0.3 through v0.5 the cap is **< 2,000 lines** of app code (tests excluded), with an audit before each release.
 
 ## 4. Fault tolerance
 
