@@ -15,37 +15,16 @@
     </div>
     <select id="db" aria-label="Database"></select>
     <input id="filterTables" type="search" placeholder="Filter tables…" aria-label="Filter tables">
+    <p id="sideMsg" class="err" role="status" hidden></p>
     <nav id="tree" aria-label="Tables"></nav>
     <button id="sqlBtn" class="wide">SQL query</button>
   </aside>
 
   <main>
-    <h1 id="title"></h1>
-
-    <section id="tablePane" hidden>
-      <div class="row">
-        <input id="q" type="search" placeholder="Search all columns… (Enter)" aria-label="Search all columns">
-        <button id="addFilter">+ Filter</button>
-        <button id="search" title="Run search (Enter)">Search</button>
-        <span class="grow"></span>
-        <button id="prev" aria-label="Previous page">‹</button>
-        <span id="pageInfo"></span>
-        <button id="next" aria-label="Next page">›</button>
-      </div>
-      <div id="filters"></div>
-    </section>
-
-    <section id="sqlPane" hidden>
-      <textarea id="sql" spellcheck="false" aria-label="SQL" placeholder="SELECT …   (⌘/Ctrl+Enter runs; runs the selection if there is one)"></textarea>
-      <div class="row">
-        <button id="run">Run</button>
-        <button id="cancel" disabled>Cancel</button>
-      </div>
-    </section>
-
-    <div id="status" role="status" aria-live="polite"></div>
-    <div id="grid"></div>
-    <pre id="cell" hidden></pre>
+    <nav id="tabs" role="tablist" aria-label="Open tabs"></nav>
+    <div id="panes">
+      <p id="empty">Pick a table on the left to open it in a tab, or open a SQL query.</p>
+    </div>
   </main>
 
   <dialog id="connDlg">

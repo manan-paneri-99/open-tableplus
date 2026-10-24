@@ -1,3 +1,4 @@
 .devdb/
 /open-tableplus
 /dist/
+.DS_Store

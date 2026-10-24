@@ -52,7 +52,12 @@ func setup(t *testing.T) *env {
 	port := srv.Listener.Addr().(*net.TCPAddr).Port
 	srv.Config.Handler = guard(port, token, app.routes())
 	srv.Start()
-	t.Cleanup(func() { srv.Close(); app.pools.CloseAll() })
+	t.Cleanup(func() {
+		srv.Close()
+		for _, p := range app.pools.m {
+			p.Close()
+		}
+	})
 
 	e := &env{t: t, url: srv.URL, token: token}
 	var c ConnView

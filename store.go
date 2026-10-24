@@ -65,11 +65,7 @@ func (c Conn) validate() error {
 	case c.Port < 0 || c.Port > 65535:
 		return userErr("port must be 1-65535")
 	}
-	switch c.SSLMode {
-	case "", "disable", "allow", "prefer", "require", "verify-ca", "verify-full":
-		return nil
-	}
-	return userErr("unknown sslmode " + strconv.Quote(c.SSLMode))
+	return nil // other settings (sslmode…) are checked by pgx when connecting
 }
 
 // Store keeps connections in a single 0600 JSON file.
