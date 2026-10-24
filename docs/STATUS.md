@@ -13,7 +13,7 @@
 - **Open: PR #3**, branch `v0.3-data-out`, CI green. It contains all of v0.3: copy, CSV export, server-side query history, environment labels and the structure view.
   - **Don't merge it until the user says so.** They asked to hold it.
   - Once they approve: merge, run the pre-release audit (line budget), then tag `v0.3.0` on `main`.
-- **Size:** app code (`*.go` excluding tests, plus `web/`) is 1,854 lines, against a budget of 2,000 through v0.5. Tests are about 760 lines.
+- **Size:** app code (`*.go` excluding tests, plus `web/`) is 1,854 lines, against a budget of 2,000 through v0.5. Tests are about 690 lines.
 
 ## How to work on it
 
