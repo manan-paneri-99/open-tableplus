@@ -1,0 +1,54 @@
+# Tests on every push/PR. Pushing a tag like v0.1.0 also builds all platforms
+# and publishes a GitHub release with the archives attached.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ['55432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Load fixture
+        run: psql -h 127.0.0.1 -p 55432 -U postgres -q -v ON_ERROR_STOP=1 -f fixture/fixture.sql
+      - run: go vet ./...
+      - name: Test
+        run: go test -race -count=1 ./...
+        env:
+          SKIP_RESTART: '1' # the service container can't be restarted from inside the job
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build all platforms
+        run: scripts/release.sh "$GITHUB_REF_NAME"
+      - name: Publish release
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

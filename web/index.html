@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Open TablePlus</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <aside>
+    <div class="row">
+      <select id="conn" aria-label="Connection"></select>
+      <button id="editConn" title="Edit connection" aria-label="Edit connection">✎</button>
+      <button id="newConn" title="New connection" aria-label="New connection">+</button>
+    </div>
+    <select id="db" aria-label="Database"></select>
+    <input id="filterTables" type="search" placeholder="Filter tables…" aria-label="Filter tables">
+    <nav id="tree" aria-label="Tables"></nav>
+    <button id="sqlBtn" class="wide">SQL query</button>
+  </aside>
+
+  <main>
+    <h1 id="title"></h1>
+
+    <section id="tablePane" hidden>
+      <div class="row">
+        <input id="q" type="search" placeholder="Search all columns… (Enter)" aria-label="Search all columns">
+        <button id="addFilter">+ Filter</button>
+        <button id="search" title="Run search (Enter)">Search</button>
+        <span class="grow"></span>
+        <button id="prev" aria-label="Previous page">‹</button>
+        <span id="pageInfo"></span>
+        <button id="next" aria-label="Next page">›</button>
+      </div>
+      <div id="filters"></div>
+    </section>
+
+    <section id="sqlPane" hidden>
+      <textarea id="sql" spellcheck="false" aria-label="SQL" placeholder="SELECT …   (⌘/Ctrl+Enter runs; runs the selection if there is one)"></textarea>
+      <div class="row">
+        <button id="run">Run</button>
+        <button id="cancel" disabled>Cancel</button>
+      </div>
+    </section>
+
+    <div id="status" role="status" aria-live="polite"></div>
+    <div id="grid"></div>
+    <pre id="cell" hidden></pre>
+  </main>
+
+  <dialog id="connDlg">
+    <form id="connForm" method="dialog">
+      <h2>Connection</h2>
+      <label>Name <input name="name" required></label>
+      <label>Host <input name="host" required value="127.0.0.1"></label>
+      <label>Port <input name="port" type="number" min="1" max="65535" value="5432"></label>
+      <label>User <input name="user" autocomplete="off"></label>
+      <label>Password <input name="password" type="password" autocomplete="new-password" placeholder="blank = keep saved / use ~/.pgpass"></label>
+      <label>Database <input name="database" value="postgres"></label>
+      <label>SSL mode
+        <select name="sslmode">
+          <option>prefer</option><option>disable</option><option>require</option><option>verify-full</option>
+        </select>
+      </label>
+      <p id="dlgMsg" role="status"></p>
+      <div class="row">
+        <button type="button" id="dlgTest">Test</button>
+        <button type="button" id="dlgDelete" class="danger">Delete</button>
+        <span class="grow"></span>
+        <button value="cancel" formnovalidate>Close</button>
+        <button type="button" id="dlgSave" class="primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
