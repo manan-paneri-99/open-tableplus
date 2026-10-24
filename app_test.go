@@ -312,6 +312,22 @@ func TestSQL(t *testing.T) {
 		t.Fatalf("logs mutated: %s rows", n)
 	}
 
+	// Session leftovers that ROLLBACK doesn't undo are reset before reuse.
+	for i := 0; i < poolMaxConns*2; i++ {
+		e.sql("SELECT pg_advisory_lock(4242)")
+		e.sql("PREPARE leftover AS SELECT 1")
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := psql(t, "fixture_a", "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 4242"); n != "0" {
+		t.Errorf("%s advisory locks left on pooled connections", n)
+	}
+	if status, _, ae := e.sql("PREPARE leftover AS SELECT 1"); status != 200 {
+		t.Errorf("prepared statement leaked across requests: %s", ae.Error)
+	}
+	if status, r, _ := e.sql("SHOW statement_timeout"); status != 200 || *r.Rows[0][0] != "30s" {
+		t.Errorf("statement_timeout lost after DISCARD ALL: %v", r.Rows)
+	}
+
 	// Errors carry positions relative to the user's text.
 	if _, _, ae := e.sql("SELEC 1"); ae.Code != "42601" || ae.Position != 1 {
 		t.Errorf("syntax error: %+v", ae)
