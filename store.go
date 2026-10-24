@@ -22,6 +22,7 @@ type Conn struct {
 	Password string `json:"password,omitempty"`
 	Database string `json:"database"`
 	SSLMode  string `json:"sslmode"`
+	Env      string `json:"env"` // "", dev, staging or prod: shown as a colour in the UI
 }
 
 // ConnView is what the API returns: never the password.
@@ -64,6 +65,8 @@ func (c Conn) validate() error {
 		return userErr("host is required")
 	case c.Port < 0 || c.Port > 65535:
 		return userErr("port must be 1-65535")
+	case c.Env != "" && c.Env != "dev" && c.Env != "staging" && c.Env != "prod":
+		return userErr("environment must be dev, staging or prod")
 	}
 	return nil // other settings (sslmode…) are checked by pgx when connecting
 }

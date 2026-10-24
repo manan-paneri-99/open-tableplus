@@ -51,6 +51,21 @@ button.wide { width: 100%; }
 #panes { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .pane { flex: 1; display: flex; flex-direction: column; gap: 6px; padding: 8px 12px; min-height: 0; }
 #empty { margin: auto; color: var(--muted); }
+.env-dev { --env: #16a34a; } .env-staging { --env: #d97706; } .env-prod { --env: #dc2626; }
+#env { align-self: flex-start; font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: #fff; background: var(--env); border-radius: 4px; padding: 1px 7px; }
+.tab.env { box-shadow: inset 0 -3px 0 var(--env); }
+.tab.env.on { box-shadow: inset 0 2px 0 var(--accent), inset 0 -3px 0 var(--env); }
+.seg { display: inline-flex; }
+.seg button { border-radius: 0; } .seg button:first-child { border-radius: 5px 0 0 5px; } .seg button:last-child { border-radius: 0 5px 5px 0; margin-left: -1px; }
+.seg button.on { background: var(--sel); }
+.structure { flex: 1; overflow: auto; }
+.structure h3 { font-size: 13px; margin: 12px 0 4px; }
+.structure table { border: 1px solid var(--line); }
+.history { display: flex; flex-direction: column; max-height: 30vh; overflow: auto; border: 1px solid var(--line); border-radius: 5px; }
+.history button { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: none; text-align: left; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+.history button:hover { background: var(--line); }
+.history button.err small { color: var(--danger); }
+.history small { font-family: system-ui, sans-serif; color: var(--muted); }
 #tree .n { overflow: hidden; text-overflow: ellipsis; flex: 1; }
 #tree small { color: var(--muted); }
 

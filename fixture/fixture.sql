@@ -48,6 +48,11 @@ INSERT INTO public.blobs VALUES (1, repeat('x', 50000));
 
 CREATE VIEW app.active_users AS SELECT id, email FROM app.users WHERE active;
 
+-- Structure view: an index, a foreign key (events -> users) and a default.
+CREATE INDEX events_user_kind_idx ON app.events (user_id, kind);
+ALTER TABLE app.events ADD CONSTRAINT events_user_fk FOREIGN KEY (user_id) REFERENCES app.users (id);
+ALTER TABLE app.users ALTER COLUMN active SET DEFAULT true;
+
 ANALYZE;
 
 \connect fixture_b

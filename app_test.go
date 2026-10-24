@@ -6,12 +6,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -502,5 +504,131 @@ func TestStoreFileMode(t *testing.T) {
 	}
 	if _, err := s.Put(Conn{Name: "", Host: "h"}); err == nil {
 		t.Error("empty name accepted")
+	}
+}
+
+// export does the browser's form POST and returns status, headers and body.
+func (e *env) export(ctx context.Context, req any) (int, http.Header, []byte) {
+	e.t.Helper()
+	b, _ := json.Marshal(req)
+	r, _ := http.NewRequestWithContext(ctx, "POST", e.url+"/api/c/"+e.conn+"/fixture_a/export",
+		strings.NewReader(url.Values{"req": {string(b)}}.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: "open_tableplus", Value: e.token})
+	res, err := http.DefaultClient.Do(r)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	return res.StatusCode, res.Header, body
+}
+
+func TestExport(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+
+	// Byte-for-byte the same as Postgres's own CSV (modulo line endings).
+	status, h, body := e.export(ctx, RowsReq{Schema: "app", Table: "users"})
+	want := psql(t, "fixture_a", `COPY (SELECT * FROM app.users ORDER BY id) TO STDOUT WITH (FORMAT csv, HEADER)`)
+	if status != 200 || strings.TrimSpace(strings.ReplaceAll(string(body), "\r\n", "\n")) != want {
+		t.Errorf("users csv: %d\n%s\nwant\n%s", status, body, want)
+	}
+	if !strings.HasPrefix(h.Get("Content-Disposition"), `attachment; filename="users-`) {
+		t.Errorf("disposition: %q", h.Get("Content-Disposition"))
+	}
+
+	// Filters apply, and there is no 100/500 row cap.
+	_, _, body = e.export(ctx, RowsReq{Schema: "app", Table: "events", Filters: []Filter{{"kind", "=", "error"}}})
+	recs, err := csv.NewReader(bytes.NewReader(body)).ReadAll()
+	if err != nil || len(recs) != 250001 || recs[0][2] != "kind" || recs[1][2] != "error" {
+		t.Errorf("filtered export: %d records, err %v", len(recs), err)
+	}
+	// No 10 KB cell cap.
+	_, _, body = e.export(ctx, RowsReq{Schema: "public", Table: "blobs"})
+	if recs, _ := csv.NewReader(bytes.NewReader(body)).ReadAll(); len(recs) != 2 || len(recs[1][1]) != 50000 {
+		t.Errorf("blob export cut")
+	}
+	// SQL export; empty result still has a header.
+	_, h, body = e.export(ctx, ExportReq{SQL: "SELECT id FROM app.events WHERE id <= 1234;"})
+	if n := strings.Count(string(body), "\r\n"); n != 1235 || !strings.Contains(h.Get("Content-Disposition"), "query-") {
+		t.Errorf("sql export: %d lines", n)
+	}
+	if _, _, body = e.export(ctx, ExportReq{SQL: "SELECT 1 AS a WHERE false"}); string(body) != "a\r\n" {
+		t.Errorf("empty export: %q", body)
+	}
+	// Read-only, multi-statement and no-row statements are refused with a JSON error.
+	for _, sql := range []string{"DELETE FROM public.logs", "SELECT 1; DELETE FROM public.logs", "SET search_path = public"} {
+		if status, h, _ := e.export(ctx, ExportReq{SQL: sql}); status == 200 || h.Get("Content-Type") != "application/json" {
+			t.Errorf("%q: %d %s", sql, status, h.Get("Content-Type"))
+		}
+	}
+
+	// Aborting a download cancels the query in Postgres.
+	actx, cancel := context.WithCancel(ctx)
+	go func() { time.Sleep(500 * time.Millisecond); cancel() }()
+	b, _ := json.Marshal(ExportReq{SQL: "SELECT * FROM app.events, generate_series(1, 100)"})
+	r, _ := http.NewRequestWithContext(actx, "POST", e.url+"/api/c/"+e.conn+"/fixture_a/export",
+		strings.NewReader(url.Values{"req": {string(b)}}.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: "open_tableplus", Value: e.token})
+	if res, err := http.DefaultClient.Do(r); err == nil {
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for psql(t, "fixture_a", "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'open-tableplus-test' AND state = 'active' AND query LIKE '%generate_series(1, 100)%'") != "0" {
+		if time.Now().After(deadline) {
+			t.Fatal("export query still running after the download was aborted")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func TestStructure(t *testing.T) {
+	e := setup(t)
+	get := func(table string) map[string]Result {
+		var s map[string]Result
+		e.must("GET", "/api/c/"+e.conn+"/fixture_a/structure?schema=app&table="+table, nil, &s)
+		return s
+	}
+	users, events := get("users"), get("events")
+	cols := users["columns"]
+	if len(cols.Rows) != 9 || *cols.Rows[0][0] != "id" || *cols.Rows[0][4] != "yes" || *cols.Rows[3][1] != "numeric(38,10)" ||
+		*cols.Rows[1][2] != "not null" || *cols.Rows[5][3] != "true" || cols.Rows[4][3] != nil {
+		t.Errorf("users columns: %+v", cols.Rows)
+	}
+	all := func(r Result) string {
+		var out []string
+		for _, row := range r.Rows {
+			for _, v := range row {
+				if v != nil {
+					out = append(out, *v)
+				}
+			}
+		}
+		return strings.Join(out, " | ")
+	}
+	if s := all(events["indexes"]); !strings.Contains(s, "events_pkey") || !strings.Contains(s, "(user_id, kind)") {
+		t.Errorf("indexes: %s", s)
+	}
+	if s := all(events["foreignKeys"]); !strings.Contains(s, "events_user_fk") || !strings.Contains(s, "REFERENCES app.users(id)") {
+		t.Errorf("foreign keys: %s", s)
+	}
+	if s := all(users["referencedBy"]); !strings.Contains(s, "app.events") || !strings.Contains(s, "events_user_fk") {
+		t.Errorf("referenced by: %s", s)
+	}
+	if status, _, _ := e.call(context.Background(), "GET", "/api/c/"+e.conn+"/fixture_a/structure?schema=app&table=nope", nil); status == 200 {
+		t.Error("missing table answered 200")
+	}
+
+	// Environment label round-trips and is validated.
+	var c ConnView
+	e.must("PUT", "/api/conns", Conn{Name: "p", Host: "h", Env: "prod"}, &c)
+	if c.Env != "prod" {
+		t.Errorf("env: %+v", c)
+	}
+	if status, _, _ := e.call(context.Background(), "PUT", "/api/conns", Conn{Name: "p", Host: "h", Env: "live"}); status != 400 {
+		t.Errorf("bad env accepted: %d", status)
 	}
 }

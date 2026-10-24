@@ -83,6 +83,8 @@ function sideMsg(msg) { $('#sideMsg').textContent = msg; $('#sideMsg').hidden = 
 function renderConnSelect() {
   $('#conn').replaceChildren(...S.conns.map((c) => h('option', { value: c.id, selected: c.id === S.conn?.id }, c.name)));
   $('#editConn').disabled = !S.conn;
+  const env = S.conn?.env;
+  Object.assign($('#env'), { textContent: env || '', className: env ? 'env-' + env : '', hidden: !env });
 }
 
 function renderDbSelect() {
@@ -166,7 +168,7 @@ function renderTabs() {
   // Show the database next to the name only when tabs span more than one.
   const many = new Set(S.tabs.map((t) => t.conn + '/' + t.db)).size > 1;
   $('#tabs').replaceChildren(...S.tabs.map((t) => h('div', {
-    class: 'tab' + (t.id === S.active ? ' on' : ''), role: 'tab', 'aria-selected': String(t.id === S.active), title: `${connName(t.conn)} / ${t.db} / ` + (t.kind === 'sql' ? 'SQL' : `${t.schema}.${t.table}`),
+    class: 'tab' + (t.id === S.active ? ' on' : '') + ((env) => env ? ` env env-${env}` : '')(S.conns.find((c) => c.id === t.conn)?.env), role: 'tab', 'aria-selected': String(t.id === S.active), title: `${connName(t.conn)} / ${t.db} / ` + (t.kind === 'sql' ? 'SQL' : `${t.schema}.${t.table}`),
     onclick: () => activate(t),
     onauxclick: (e) => { if (e.button === 1) { e.preventDefault(); closeTab(t); } },
   },
@@ -218,11 +220,40 @@ function buildTablePane(tab) {
   e.status = h('div', { class: 'status', role: 'status' });
   e.grid = h('div', { class: 'grid' });
   e.cell = h('pre', { class: 'cell', hidden: true });
+  e.dataBtn = h('button', { class: 'on', onclick: () => showStructure(tab, false) }, 'Data');
+  e.structBtn = h('button', { onclick: () => showStructure(tab, true) }, 'Structure');
+  e.tools = h('span', { class: 'row grow' }, e.q,
+    h('button', { onclick: () => addFilter(tab) }, '+ Filter'), e.search,
+    h('button', { title: 'Download every matching row (current search, filters and sort)', onclick: () => exportCSV(tab, tableReq(tab)) }, 'Export CSV'),
+    h('span', { class: 'grow' }), e.prev, e.pageInfo, e.next);
+  e.structure = h('div', { class: 'structure', hidden: true });
   e.pane = h('section', { class: 'pane' },
-    h('div', { class: 'row' }, e.q,
-      h('button', { onclick: () => addFilter(tab) }, '+ Filter'), e.search,
-      h('span', { class: 'grow' }), e.prev, e.pageInfo, e.next),
-    e.filters, e.status, e.grid, e.cell);
+    h('div', { class: 'row' }, h('span', { class: 'seg' }, e.dataBtn, e.structBtn), e.tools),
+    e.filters, e.status, e.grid, e.structure, e.cell);
+}
+
+async function showStructure(tab, on) {
+  const e = tab.el;
+  e.dataBtn.classList.toggle('on', !on); e.structBtn.classList.toggle('on', on);
+  e.tools.hidden = e.filters.hidden = e.grid.hidden = on;
+  e.structure.hidden = !on; e.cell.hidden = true;
+  if (!on || e.structure.childElementCount) return;
+  setStatus(tab, 'Loading…');
+  try {
+    const st = await api('GET', `/c/${enc(tab.conn)}/${enc(tab.db)}/structure?schema=${enc(tab.schema)}&table=${enc(tab.table)}`);
+    e.structure.replaceChildren(...[['columns', 'Columns'], ['indexes', 'Indexes'], ['foreignKeys', 'Foreign keys'], ['referencedBy', 'Referenced by']]
+      .map(([k, label]) => h('section', {}, h('h3', {}, label), st[k].rows.length ? gridTable(tab, st[k]) : h('p', { class: 'status' }, 'None'))));
+    setStatus(tab, '');
+  } catch (err) { setStatus(tab, errText(err), true); }
+}
+
+// tableReq is the table view as the server sees it: applied search, filters and sort.
+function tableReq(tab) {
+  const t = tab.t;
+  return {
+    schema: tab.schema, table: tab.table, q: t.q, sort: t.sort, desc: t.desc,
+    filters: t.filters.filter((f) => f.col && (f.op.startsWith('is') || f.val !== '')),
+  };
 }
 
 function setStatus(tab, msg, err) {
@@ -240,10 +271,7 @@ async function loadRows(tab) {
   setStatus(tab, 'Loading…');
   saveTabs();
   try {
-    const res = await api('POST', `/c/${enc(tab.conn)}/${enc(tab.db)}/rows`, {
-      schema: tab.schema, table: tab.table, q: t.q, sort: t.sort, desc: t.desc, page: t.page,
-      filters: t.filters.filter((f) => f.col && (f.op.startsWith('is') || f.val !== '')),
-    }, ctl.signal);
+    const res = await api('POST', `/c/${enc(tab.conn)}/${enc(tab.db)}/rows`, { ...tableReq(tab), page: t.page }, ctl.signal);
     const firstLoad = !t.columns.length;
     t.columns = res.columns;
     if (firstLoad) renderFilters(tab);
@@ -264,7 +292,15 @@ async function loadRows(tab) {
 
 const numeric = /^(smallint|integer|bigint|numeric|real|double precision|money|oid)\b/;
 
+// renderGrid shows a result in the tab's main grid, where cells can be selected and copied.
 function renderGrid(tab, res, sortable) {
+  tab.res = res; tab.sel = null;
+  tab.el.grid.replaceChildren(gridTable(tab, res, sortable, true));
+  tab.el.grid.scrollTo(0, 0);
+  tab.el.cell.hidden = true;
+}
+
+function gridTable(tab, res, sortable, selectable) {
   const t = tab.t;
   const cut = new Set((res.cut || []).map(([r, c]) => r + ',' + c));
   const num = res.columns.map((c) => numeric.test(c.type));
@@ -278,16 +314,51 @@ function renderGrid(tab, res, sortable) {
   }, c.name + (c.pk ? ' 🔑' : '') + (sortable && t.sort === c.name ? (t.desc ? ' ↓' : ' ↑') : ''), h('small', {}, c.type))));
   const body = res.rows.map((row, r) => h('tr', {}, row.map((v, i) => h('td', {
     class: [v === null && 'null', num[i] && 'num', cut.has(r + ',' + i) && 'cut'].filter(Boolean).join(' ') || null,
-    onclick: (e) => showCell(tab, e.currentTarget, res.columns[i], v, cut.has(r + ',' + i)),
+    onmousedown: (e) => { if (e.shiftKey) e.preventDefault(); }, // shift-click extends the cell selection, not a text selection
+    onclick: (e) => { if (selectable) select(tab, r, i, e.shiftKey); showCell(tab, res.columns[i], v, cut.has(r + ',' + i)); },
   }, v === null ? 'NULL' : v.length > 300 ? v.slice(0, 300) : v))));
-  tab.el.grid.replaceChildren(h('table', {}, h('thead', {}, head), h('tbody', {}, body)));
-  tab.el.grid.scrollTo(0, 0);
-  tab.el.cell.hidden = true;
+  return h('table', {}, h('thead', {}, head), h('tbody', {}, body));
 }
 
-function showCell(tab, td, col, v, wasCut) {
-  tab.el.grid.querySelectorAll('td.on').forEach((x) => x.classList.remove('on'));
-  td.classList.add('on');
+// Selection is a rectangle from the clicked cell to the shift-clicked one.
+const bounds = (s) => [Math.min(s.r0, s.r1), Math.max(s.r0, s.r1), Math.min(s.c0, s.c1), Math.max(s.c0, s.c1)];
+
+function select(tab, r, c, extend) {
+  tab.sel = extend && tab.sel ? { ...tab.sel, r1: r, c1: c } : { r0: r, c0: c, r1: r, c1: c };
+  const [r0, r1, c0, c1] = bounds(tab.sel);
+  tab.el.grid.querySelectorAll('tbody tr').forEach((tr, ri) =>
+    [...tr.children].forEach((td, ci) => td.classList.toggle('on', ri >= r0 && ri <= r1 && ci >= c0 && ci <= c1)));
+}
+
+// ⌘/Ctrl+C on a cell selection copies TSV; copying text in inputs or the cell viewer is left alone.
+document.addEventListener('copy', (e) => {
+  const tab = activeTab();
+  if (!tab?.sel || tab.el.grid.hidden || /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName) || !getSelection().isCollapsed) return;
+  const [r0, r1, c0, c1] = bounds(tab.sel);
+  const field = (v) => v === null ? '' : /[\t\n\r"]/.test(v) ? `"${v.replaceAll('"', '""')}"` : v;
+  e.clipboardData.setData('text/plain', tab.res.rows.slice(r0, r1 + 1).map((row) => row.slice(c0, c1 + 1).map(field).join('\t')).join('\n'));
+  e.preventDefault();
+  const cut = (tab.res.cut || []).filter(([r, c]) => r >= r0 && r <= r1 && c >= c0 && c <= c1).length;
+  setStatus(tab, `Copied ${(r1 - r0 + 1) * (c1 - c0 + 1)} cells.` + (cut ? ` ${cut} ${cut === 1 ? 'was' : 'were'} cut at 10 KB; use Export CSV for full values.` : ''), cut > 0);
+});
+
+// Export is a form POST into a hidden frame: the browser streams the CSV to
+// disk. Only an error (JSON) ever renders in the frame.
+let exportTab = null;
+function exportCSV(tab, req) {
+  exportTab = tab;
+  const f = h('form', { method: 'POST', action: `/api/c/${enc(tab.conn)}/${enc(tab.db)}/export`, target: 'dl', hidden: true },
+    h('input', { type: 'hidden', name: 'req', value: JSON.stringify(req) }));
+  document.body.append(f); f.submit(); f.remove();
+  setStatus(tab, 'Export started: the file downloads as rows stream in.');
+}
+$('#dl').onload = () => {
+  let err;
+  try { err = JSON.parse($('#dl').contentDocument.body.textContent); } catch { return; }
+  if (exportTab && err?.error) setStatus(exportTab, 'Export failed: ' + errText({ ...err, message: err.error }), true);
+};
+
+function showCell(tab, col, v, wasCut) {
   tab.el.cell.hidden = false;
   tab.el.cell.textContent = `${col.name} (${col.type})${wasCut ? ' — first 10 KB only' : ''}\n\n` + (v === null ? 'NULL' : v === '' ? "'' (empty string)" : v);
 }
@@ -330,14 +401,45 @@ function buildSqlPane(tab) {
   e.status = h('div', { class: 'status', role: 'status' }, 'Read-only: every statement runs inside a READ ONLY transaction.');
   e.grid = h('div', { class: 'grid' });
   e.cell = h('pre', { class: 'cell', hidden: true });
-  e.pane = h('section', { class: 'pane' }, e.sql, h('div', { class: 'row' }, e.run, e.cancel), e.status, e.grid, e.cell);
+  e.hist = h('div', { class: 'history', hidden: true });
+  e.pane = h('section', { class: 'pane' }, e.sql,
+    h('div', { class: 'row' }, e.run, e.cancel,
+      h('button', { title: 'Download every row of the query', onclick: () => sqlText(tab).sql.trim() && exportCSV(tab, { sql: sqlText(tab).sql }) }, 'Export CSV'),
+      h('span', { class: 'grow' }),
+      h('button', { onclick: () => { e.hist.hidden = !e.hist.hidden; renderHistory(tab); } }, 'History')),
+    e.hist, e.status, e.grid, e.cell);
+}
+
+// sqlText is the selection if there is one, else the whole editor.
+function sqlText(tab) {
+  const ta = tab.el.sql, selected = ta.selectionStart !== ta.selectionEnd;
+  return { sql: selected ? ta.value.slice(ta.selectionStart, ta.selectionEnd) : ta.value, offset: selected ? ta.selectionStart : 0 };
+}
+
+// History: last 100 statements per connection/database, newest first, in localStorage.
+const HISTORY = 'open-tableplus.history';
+const readHistory = () => { try { return JSON.parse(localStorage.getItem(HISTORY) || '{}'); } catch { return {}; } };
+
+function remember(tab, entry) {
+  const all = readHistory(), key = tab.conn + '/' + tab.db;
+  all[key] = [entry, ...(all[key] || []).filter((x) => x.sql !== entry.sql)].slice(0, 100);
+  try { localStorage.setItem(HISTORY, JSON.stringify(all)); } catch { /* storage unavailable */ }
+  renderHistory(tab);
+}
+
+function renderHistory(tab) {
+  if (tab.el.hist.hidden) return;
+  const items = readHistory()[tab.conn + '/' + tab.db] || [];
+  tab.el.hist.replaceChildren(...items.map((x) => h('button', {
+    class: x.ok ? null : 'err', title: x.sql,
+    onclick: () => { tab.el.sql.value = tab.sql = x.sql; saveTabs(); tab.el.sql.focus(); },
+  }, h('small', {}, `${new Date(x.at).toLocaleString()} · ${x.info}`), h('span', {}, x.sql.trim().split('\n')[0]))));
+  if (!items.length) tab.el.hist.append(h('p', { class: 'status' }, 'No queries yet.'));
 }
 
 async function runSQL(tab) {
   const ta = tab.el.sql;
-  const selected = ta.selectionStart !== ta.selectionEnd;
-  const offset = selected ? ta.selectionStart : 0;
-  const sql = selected ? ta.value.slice(ta.selectionStart, ta.selectionEnd) : ta.value;
+  const { sql, offset } = sqlText(tab);
   if (!sql.trim()) return;
   tab.inflight?.abort();
   const ctl = tab.inflight = new AbortController();
@@ -348,9 +450,12 @@ async function runSQL(tab) {
     const res = await api('POST', `/c/${enc(tab.conn)}/${enc(tab.db)}/sql`, { sql }, ctl.signal);
     renderGrid(tab, res, false);
     setStatus(tab, `${res.tag}${res.more ? ` — first ${res.rows.length} rows shown` : ''} · ${res.ms} ms`);
+    remember(tab, { sql, at: Date.now(), ok: true, info: `${res.tag} · ${res.ms} ms` });
   } catch (e) {
     if (e.name === 'AbortError') setStatus(tab, 'Cancelled.');
     else {
+      tab.res = tab.sel = null; tab.el.grid.replaceChildren(); // don't leave the previous result under the error
+      remember(tab, { sql, at: Date.now(), ok: false, info: e.code || 'error' });
       setStatus(tab, errText(e) + (e.position ? `\nAt character ${e.position}.` : ''), true);
       if (e.position && S.active === tab.id) { const p = offset + e.position - 1; ta.focus(); ta.setSelectionRange(p, p + 1); }
     }
@@ -376,7 +481,7 @@ function openDialog(conn) {
   editing = conn;
   const f = $('#connForm');
   f.reset();
-  for (const k of ['name', 'host', 'port', 'user', 'database', 'sslmode']) if (conn) f.elements[k].value = conn[k] ?? '';
+  for (const k of ['name', 'host', 'port', 'user', 'database', 'sslmode', 'env']) if (conn) f.elements[k].value = conn[k] ?? '';
   f.elements.password.placeholder = conn?.hasPassword ? 'saved — leave blank to keep' : 'blank = use ~/.pgpass';
   $('#dlgDelete').hidden = !conn;
   dlgMsg('');
@@ -389,7 +494,7 @@ function formConn() {
   const f = $('#connForm').elements;
   return {
     id: editing?.id || '', name: f.name.value.trim(), host: f.host.value.trim(), port: Number(f.port.value) || 5432,
-    user: f.user.value.trim(), password: f.password.value, database: f.database.value.trim() || 'postgres', sslmode: f.sslmode.value,
+    user: f.user.value.trim(), password: f.password.value, database: f.database.value.trim() || 'postgres', sslmode: f.sslmode.value, env: f.env.value,
   };
 }
 
@@ -406,8 +511,9 @@ $('#dlgSave').onclick = async () => {
     S.conns = await api('GET', '/conns');
     S.conn = null; // force reload of dbs/tree with the new settings
     $('#connDlg').close();
-    renderTabs(); // names may have changed
-    selectContext(saved.id, '');
+    renderTabs(); // names and environments may have changed
+    const a = activeTab();
+    selectContext(saved.id, a?.conn === saved.id ? a.db : '');
   } catch (e) { dlgMsg(errText(e), true); }
 };
 
