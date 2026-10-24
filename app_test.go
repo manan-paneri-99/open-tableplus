@@ -31,6 +31,7 @@ type env struct {
 	url   string
 	token string
 	conn  string // id of the fixture connection
+	dir   string // config dir
 }
 
 func setup(t *testing.T) *env {
@@ -61,7 +62,7 @@ func setup(t *testing.T) *env {
 		}
 	})
 
-	e := &env{t: t, url: srv.URL, token: token}
+	e := &env{t: t, url: srv.URL, token: token, dir: dir}
 	var c ConnView
 	e.must("PUT", "/api/conns", Conn{Name: "fixture", Host: "127.0.0.1", Port: devPort, User: "postgres", Database: "fixture_a", SSLMode: "disable"}, &c)
 	e.conn = c.ID
@@ -630,5 +631,63 @@ func TestStructure(t *testing.T) {
 	}
 	if status, _, _ := e.call(context.Background(), "PUT", "/api/conns", Conn{Name: "p", Host: "h", Env: "live"}); status != 400 {
 		t.Errorf("bad env accepted: %d", status)
+	}
+}
+
+func TestHistory(t *testing.T) {
+	e := setup(t)
+	hist := func(db string) []HistoryEntry {
+		var h []HistoryEntry
+		e.must("GET", "/api/c/"+e.conn+"/"+db+"/history", nil, &h)
+		return h
+	}
+	if h := hist("fixture_a"); h == nil || len(h) != 0 {
+		t.Fatalf("empty history should be []: %v", h)
+	}
+	e.sql("SELECT 1")
+	e.sql("SELECT * FROM nope")
+	e.sql("  SELECT 1  ") // a repeat moves to the top (trimmed)
+	h := hist("fixture_a")
+	if len(h) != 2 || h[0].SQL != "SELECT 1" || !h[0].OK || h[0].Info[:8] != "SELECT 1" ||
+		h[1].SQL != "SELECT * FROM nope" || h[1].OK || h[1].Info != "42P01" || h[0].At < h[1].At {
+		t.Errorf("history: %+v", h)
+	}
+
+	// A cancelled run isn't recorded.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	e.call(ctx, "POST", "/api/c/"+e.conn+"/fixture_a/sql", map[string]string{"sql": "SELECT pg_sleep(5)"})
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+	if h := hist("fixture_a"); len(h) != 2 {
+		t.Errorf("cancelled run recorded: %+v", h[0])
+	}
+
+	// Capped at 100, and kept per database.
+	for i := 0; i < 120; i++ {
+		e.sql(fmt.Sprintf("SELECT %d", i))
+	}
+	if h := hist("fixture_a"); len(h) != historyCap || h[0].SQL != "SELECT 119" {
+		t.Errorf("cap: %d entries, newest %q", len(h), h[0].SQL)
+	}
+	if h := hist("fixture_b"); len(h) != 0 {
+		t.Errorf("fixture_b shares history: %d", len(h))
+	}
+
+	// On disk, 0600, and survives a restart; deleting the connection deletes it.
+	dir := e.dir
+	st, err := os.Stat(dir + "/history.json")
+	if err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("history.json: %v %v", st, err)
+	}
+	reopened, err := OpenStore(dir)
+	if err != nil || len(reopened.History(e.conn+"/fixture_a")) != historyCap {
+		t.Fatalf("history lost on restart: %v", err)
+	}
+	e.must("DELETE", "/api/conns/"+e.conn, nil, nil)
+	if h := hist("fixture_a"); len(h) != 0 {
+		t.Errorf("history kept after deleting the connection: %d", len(h))
+	}
+	if b, _ := os.ReadFile(dir + "/history.json"); strings.Contains(string(b), e.conn) {
+		t.Error("history.json still mentions the deleted connection")
 	}
 }

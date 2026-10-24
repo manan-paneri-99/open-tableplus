@@ -416,20 +416,13 @@ function sqlText(tab) {
   return { sql: selected ? ta.value.slice(ta.selectionStart, ta.selectionEnd) : ta.value, offset: selected ? ta.selectionStart : 0 };
 }
 
-// History: last 100 statements per connection/database, newest first, in localStorage.
-const HISTORY = 'open-tableplus.history';
-const readHistory = () => { try { return JSON.parse(localStorage.getItem(HISTORY) || '{}'); } catch { return {}; } };
-
-function remember(tab, entry) {
-  const all = readHistory(), key = tab.conn + '/' + tab.db;
-  all[key] = [entry, ...(all[key] || []).filter((x) => x.sql !== entry.sql)].slice(0, 100);
-  try { localStorage.setItem(HISTORY, JSON.stringify(all)); } catch { /* storage unavailable */ }
-  renderHistory(tab);
-}
-
-function renderHistory(tab) {
+// History is recorded by the server (history.json in the config dir) for
+// every statement run here; this only shows it.
+async function renderHistory(tab) {
   if (tab.el.hist.hidden) return;
-  const items = readHistory()[tab.conn + '/' + tab.db] || [];
+  let items;
+  try { items = await api('GET', `/c/${enc(tab.conn)}/${enc(tab.db)}/history`); }
+  catch (e) { setStatus(tab, errText(e), true); return; }
   tab.el.hist.replaceChildren(...items.map((x) => h('button', {
     class: x.ok ? null : 'err', title: x.sql,
     onclick: () => { tab.el.sql.value = tab.sql = x.sql; saveTabs(); tab.el.sql.focus(); },
@@ -450,12 +443,10 @@ async function runSQL(tab) {
     const res = await api('POST', `/c/${enc(tab.conn)}/${enc(tab.db)}/sql`, { sql }, ctl.signal);
     renderGrid(tab, res, false);
     setStatus(tab, `${res.tag}${res.more ? ` — first ${res.rows.length} rows shown` : ''} · ${res.ms} ms`);
-    remember(tab, { sql, at: Date.now(), ok: true, info: `${res.tag} · ${res.ms} ms` });
   } catch (e) {
     if (e.name === 'AbortError') setStatus(tab, 'Cancelled.');
     else {
       tab.res = tab.sel = null; tab.el.grid.replaceChildren(); // don't leave the previous result under the error
-      remember(tab, { sql, at: Date.now(), ok: false, info: e.code || 'error' });
       setStatus(tab, errText(e) + (e.position ? `\nAt character ${e.position}.` : ''), true);
       if (e.position && S.active === tab.id) { const p = offset + e.position - 1; ta.focus(); ta.setSelectionRange(p, p + 1); }
     }
@@ -463,6 +454,7 @@ async function runSQL(tab) {
     clearInterval(tick);
     if (tab.inflight === ctl) tab.inflight = null;
     tab.el.run.disabled = false; tab.el.cancel.disabled = true;
+    renderHistory(tab);
   }
 }
 

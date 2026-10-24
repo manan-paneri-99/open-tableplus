@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -76,8 +78,22 @@ func (a *App) routes() http.Handler {
 		if err := readJSON(r, &req); err != nil {
 			return nil, err
 		}
-		return RunSQL(ctx, p, req.SQL)
+		res, err := RunSQL(ctx, p, req.SQL)
+		if sql := strings.TrimSpace(req.SQL); sql != "" && r.Context().Err() == nil { // cancelled runs aren't history
+			e := HistoryEntry{SQL: sql, At: time.Now().UnixMilli(), OK: err == nil, Info: "error"}
+			var pe *pgconn.PgError
+			if err == nil {
+				e.Info = fmt.Sprintf("%s · %d ms", res.Tag, res.Ms)
+			} else if errors.As(err, &pe) {
+				e.Info = pe.Code
+			}
+			a.store.Remember(r.PathValue("id")+"/"+r.PathValue("db"), e)
+		}
+		return res, err
 	}))
+	mux.HandleFunc("GET /api/c/{id}/{db}/history", func(w http.ResponseWriter, r *http.Request) {
+		reply(w, r, a.store.History(r.PathValue("id")+"/"+r.PathValue("db")), nil)
+	})
 	// Export is a form POST so the browser streams the response to a file.
 	mux.HandleFunc("POST /api/c/{id}/{db}/export", func(w http.ResponseWriter, r *http.Request) {
 		var req ExportReq

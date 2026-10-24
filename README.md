@@ -26,7 +26,7 @@ go build -o open-tableplus . && ./open-tableplus
 scripts/release.sh v0.1.0   # all platforms → dist/, with SHA256SUMS
 ```
 
-Connections are saved in `~/.config/open-tableplus/connections.json` (mode 0600). Leave the password blank to use `~/.pgpass`.
+Connections and query history are saved in `~/.config/open-tableplus/` (`connections.json`, `history.json`, both mode 0600). Leave the password blank to use `~/.pgpass`.
 
 Every query runs inside a `READ ONLY` transaction, so Postgres refuses writes. For production databases, also connect with a read-only role.
 
