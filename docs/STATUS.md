@@ -11,8 +11,8 @@
   - v0.2.1: pooled sessions are reset with `DISCARD ALL`; README roadmap.
   - v0.2.0: tabs, and search/filters run on Enter.
   - v0.1.0: marked pre-release; it crashes on filters that match no rows.
-- **Open PRs:** none.
-- **Size:** app code (`*.go` excluding tests, plus `web/`) is 1,854 lines, against a budget of 2,000 through v0.5. Tests are about 690 lines.
+- **Open: PR #4**, branch `status-v0.3.0`: these docs plus all of v0.4 (safe editing, see `docs/v0.4-plan.md`). Not merged or tagged; wait for the user.
+- **Size:** app code (`*.go` excluding tests, plus `web/`) is **2,107 lines, over the 2,000 budget** (v0.3.0 was 1,854; editing added ~250). The user must decide: raise the budget, or cut scope. Tests are about 785 lines.
 
 ## How to work on it
 
@@ -36,13 +36,14 @@ See `CLAUDE.md` for commands and conventions. The release flow:
 | SQLite was considered for storage and rejected for now | A large dependency for a 100-entry list. Revisit when SQLite is added as a browsable engine, since the driver comes along then |
 | URL-hash routing removed (v0.2 audit) | Saved tabs already cover restoring after a reload |
 | Postgres-specific code stays in `db.go`; no engine interface yet | Build the interface when a second engine is actually added |
+| Edits use untyped parameters, and match rows on the primary key plus the original text of the checked columns | Postgres infers each value's type from its column and rejects unknown columns, so no type code. Comparing as text works for every type (json has no `=`), and exactly one row must change, or the whole apply rolls back |
 | Roadmap order: v0.3 get data out, v0.4 safe editing, v0.5 SSH/TLS | The user chose editing before SSH |
 | Binaries are unsigned for now | Signing needs paid Apple/Windows certificates; the README documents the first-launch workaround |
 
 ## Gaps vs the original `product-spec.md`
 
 - **Phase 1 (read-only explorer):** complete once v0.3 merges, except **syntax highlighting**.
-- **Phase 2 (safe editing):** not started; it's v0.4.
+- **Phase 2 (safe editing):** built in PR #4 (v0.4); not released yet.
 - **Phase 3 (polish):** missing **saved queries** and a **diagnostics view**.
 - **Phase 4:** SSH/TLS is v0.5; other engines are "Later"; import, backup and ER diagrams are not planned.
 - **Non-functional requirements:**
@@ -69,12 +70,5 @@ See `CLAUDE.md` for commands and conventions. The release flow:
 
 ## Next steps
 
-1. **v0.4, safe editing:** write `docs/v0.4-plan.md` first, in the same format as `v0.3-plan.md`. Scope comes from the README roadmap and `product-spec.md` Phase 2:
-   - opt-in per connection;
-   - edit, insert and delete only on tables with a primary key;
-   - review pending changes before applying;
-   - one transaction, with conflict detection (include original values in the `WHERE`);
-   - an extra confirmation when the connection's `env` is `prod`.
-
-   This is the first feature that writes, so the read-only guarantees need a deliberate, tested exception that only the edit endpoint can use.
+1. **v0.4, safe editing:** built in PR #4 (`docs/v0.4-plan.md`). Settle the line budget, get the user's review, then merge and tag `v0.4.0`. Only `Edit` in `db.go` opens a `READ WRITE` transaction, and only when the connection has `editable` set.
 2. **Later:** v0.5 SSH/TLS; then syntax highlighting, saved queries, grid keyboard navigation, Firefox/Safari checks, signed binaries and Homebrew, and MySQL/SQLite.

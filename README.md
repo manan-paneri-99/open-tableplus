@@ -1,6 +1,6 @@
 # Open TablePlus
 
-A local, read-only web UI for browsing and searching PostgreSQL databases. One Go binary, one dependency (`pgx`), no build step for the UI.
+A local web UI for browsing and searching PostgreSQL databases: read-only unless you turn on editing for a connection. One Go binary, one dependency (`pgx`), no build step for the UI.
 
 ## Install (no Go needed)
 
@@ -47,7 +47,7 @@ scripts/release.sh v0.1.0   # all platforms → dist/, with SHA256SUMS
 
 Connections and query history are saved in `~/.config/open-tableplus/` (`connections.json`, `history.json`, both mode 0600). Leave the password blank to use `~/.pgpass`.
 
-Every query runs inside a `READ ONLY` transaction, so Postgres refuses writes. For production databases, also connect with a read-only role.
+Every query runs inside a `READ ONLY` transaction, so Postgres refuses writes. The one exception is grid editing (v0.4), which is off unless you tick "Allow editing" on a connection, and only writes the changes you review and apply. For production databases, also connect with a read-only role.
 
 ## Development
 
@@ -78,12 +78,14 @@ Read-only and reliable first, then writes, then reach. App code (excluding tests
   - Environment label per connection (a red `prod` badge and coloured tabs).
   - Structure view: columns, indexes and foreign keys.
 
-**Next**
+**In review (PR #4)**
 - **v0.4: Safe editing,** opt-in per connection.
   - Edit, insert and delete rows in tables that have a primary key.
   - Review pending changes before applying.
   - Apply in one transaction with conflict detection.
   - Extra confirmation on `prod`.
+
+**Next**
 - **v0.5: Reach real servers.**
   - SSH tunnels through a bastion host.
   - TLS CA and client certificates.

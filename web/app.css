@@ -61,6 +61,9 @@ button.wide { width: 100%; }
 .structure { flex: 1; overflow: auto; }
 .structure h3 { font-size: 13px; margin: 12px 0 4px; }
 .structure table { border: 1px solid var(--line); }
+.review { display: flex; flex-direction: column; gap: 3px; max-height: 25vh; overflow: auto; border: 1px solid var(--pending); border-radius: 5px; padding: 6px; }
+.review code { font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+.edit { display: flex; flex-direction: column; gap: 4px; }
 .history { display: flex; flex-direction: column; max-height: 30vh; overflow: auto; border: 1px solid var(--line); border-radius: 5px; }
 .history button { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: none; text-align: left; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
 .history button:hover { background: var(--line); }
@@ -85,6 +88,8 @@ th small { display: block; font-weight: 400; color: var(--muted); }
 td.num { text-align: right; }
 td.null { color: var(--muted); font-style: italic; }
 td.cut::after { content: " …"; color: var(--pending); }
+td.dirty, tr.ch-insert td { background: color-mix(in srgb, var(--pending) 22%, transparent); }
+tr.ch-delete td { text-decoration: line-through; opacity: .55; }
 td.on { background: var(--sel); }
 .cell { margin: 0; max-height: 30vh; overflow: auto; padding: 8px; background: var(--panel); border-radius: 5px; white-space: pre-wrap; word-break: break-all; font-size: 12px; }
 
