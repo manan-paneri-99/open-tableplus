@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,6 +23,7 @@ type Conn struct {
 	Password string `json:"password,omitempty"`
 	Database string `json:"database"`
 	SSLMode  string `json:"sslmode"`
+	Env      string `json:"env"` // "", dev, staging or prod: shown as a colour in the UI
 }
 
 // ConnView is what the API returns: never the password.
@@ -64,30 +66,55 @@ func (c Conn) validate() error {
 		return userErr("host is required")
 	case c.Port < 0 || c.Port > 65535:
 		return userErr("port must be 1-65535")
+	case c.Env != "" && c.Env != "dev" && c.Env != "staging" && c.Env != "prod":
+		return userErr("environment must be dev, staging or prod")
 	}
 	return nil // other settings (sslmode…) are checked by pgx when connecting
 }
 
-// Store keeps connections in a single 0600 JSON file.
+const historyCap = 100 // statements kept per connection/database
+
+// HistoryEntry is one statement run from a SQL tab.
+type HistoryEntry struct {
+	SQL  string `json:"sql"`
+	At   int64  `json:"at"` // unix milliseconds
+	OK   bool   `json:"ok"`
+	Info string `json:"info"` // "SELECT 3 · 5 ms", or the SQLSTATE on error
+}
+
+// Store keeps connections and query history in two 0600 JSON files.
 type Store struct {
-	mu    sync.Mutex
-	path  string
-	conns []Conn
+	mu       sync.Mutex
+	path     string
+	conns    []Conn
+	histPath string
+	history  map[string][]HistoryEntry // key: connection ID + "/" + database
 }
 
 func OpenStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	s := &Store{path: filepath.Join(dir, "connections.json")}
-	b, err := os.ReadFile(s.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return s, nil
+	s := &Store{
+		path:     filepath.Join(dir, "connections.json"),
+		histPath: filepath.Join(dir, "history.json"),
+		history:  map[string][]HistoryEntry{},
 	}
-	if err != nil {
+	if err := loadJSON(s.path, &s.conns); err != nil {
 		return nil, err
 	}
-	return s, json.Unmarshal(b, &s.conns)
+	return s, loadJSON(s.histPath, &s.history)
+}
+
+func loadJSON(path string, v any) error {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, v)
 }
 
 func (s *Store) List() []ConnView {
@@ -150,18 +177,52 @@ func (s *Store) Delete(id string) error {
 	for i := range s.conns {
 		if s.conns[i].ID == id {
 			s.conns = append(s.conns[:i], s.conns[i+1:]...)
+			for key := range s.history {
+				if strings.HasPrefix(key, id+"/") {
+					delete(s.history, key)
+				}
+			}
+			if err := writeJSON(s.histPath, s.history); err != nil {
+				return err
+			}
 			return s.save()
 		}
 	}
 	return notFound("connection")
 }
 
-func (s *Store) save() error {
-	b, err := json.MarshalIndent(s.conns, "", "  ")
+func (s *Store) save() error { return writeJSON(s.path, s.conns) }
+
+// Remember records a statement: newest first, a repeated statement moves to
+// the top, at most historyCap per connection/database. History is a
+// convenience, so a failed write is logged rather than failing the query.
+func (s *Store) Remember(key string, e HistoryEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	list := []HistoryEntry{e}
+	for _, x := range s.history[key] {
+		if x.SQL != e.SQL && len(list) < historyCap {
+			list = append(list, x)
+		}
+	}
+	s.history[key] = list
+	if err := writeJSON(s.histPath, s.history); err != nil {
+		log.Printf("saving history: %v", err)
+	}
+}
+
+func (s *Store) History(key string) []HistoryEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]HistoryEntry{}, s.history[key]...) // [] not null when empty
+}
+
+func writeJSON(path string, v any) error {
+	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(s.path, b)
+	return writeFileAtomic(path, b)
 }
 
 func writeFileAtomic(path string, b []byte) error {

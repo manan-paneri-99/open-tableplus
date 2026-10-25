@@ -6,12 +6,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -29,6 +31,7 @@ type env struct {
 	url   string
 	token string
 	conn  string // id of the fixture connection
+	dir   string // config dir
 }
 
 func setup(t *testing.T) *env {
@@ -59,7 +62,7 @@ func setup(t *testing.T) *env {
 		}
 	})
 
-	e := &env{t: t, url: srv.URL, token: token}
+	e := &env{t: t, url: srv.URL, token: token, dir: dir}
 	var c ConnView
 	e.must("PUT", "/api/conns", Conn{Name: "fixture", Host: "127.0.0.1", Port: devPort, User: "postgres", Database: "fixture_a", SSLMode: "disable"}, &c)
 	e.conn = c.ID
@@ -502,5 +505,189 @@ func TestStoreFileMode(t *testing.T) {
 	}
 	if _, err := s.Put(Conn{Name: "", Host: "h"}); err == nil {
 		t.Error("empty name accepted")
+	}
+}
+
+// export does the browser's form POST and returns status, headers and body.
+func (e *env) export(ctx context.Context, req any) (int, http.Header, []byte) {
+	e.t.Helper()
+	b, _ := json.Marshal(req)
+	r, _ := http.NewRequestWithContext(ctx, "POST", e.url+"/api/c/"+e.conn+"/fixture_a/export",
+		strings.NewReader(url.Values{"req": {string(b)}}.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: "open_tableplus", Value: e.token})
+	res, err := http.DefaultClient.Do(r)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	return res.StatusCode, res.Header, body
+}
+
+func TestExport(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+
+	// Byte-for-byte the same as Postgres's own CSV (modulo line endings).
+	status, h, body := e.export(ctx, RowsReq{Schema: "app", Table: "users"})
+	want := psql(t, "fixture_a", `COPY (SELECT * FROM app.users ORDER BY id) TO STDOUT WITH (FORMAT csv, HEADER)`)
+	if status != 200 || strings.TrimSpace(strings.ReplaceAll(string(body), "\r\n", "\n")) != want {
+		t.Errorf("users csv: %d\n%s\nwant\n%s", status, body, want)
+	}
+	if !strings.HasPrefix(h.Get("Content-Disposition"), `attachment; filename="users-`) {
+		t.Errorf("disposition: %q", h.Get("Content-Disposition"))
+	}
+
+	// Filters apply, and there is no 100/500 row cap.
+	_, _, body = e.export(ctx, RowsReq{Schema: "app", Table: "events", Filters: []Filter{{"kind", "=", "error"}}})
+	recs, err := csv.NewReader(bytes.NewReader(body)).ReadAll()
+	if err != nil || len(recs) != 250001 || recs[0][2] != "kind" || recs[1][2] != "error" {
+		t.Errorf("filtered export: %d records, err %v", len(recs), err)
+	}
+	// No 10 KB cell cap.
+	_, _, body = e.export(ctx, RowsReq{Schema: "public", Table: "blobs"})
+	if recs, _ := csv.NewReader(bytes.NewReader(body)).ReadAll(); len(recs) != 2 || len(recs[1][1]) != 50000 {
+		t.Errorf("blob export cut")
+	}
+	// SQL export; empty result still has a header.
+	_, h, body = e.export(ctx, ExportReq{SQL: "SELECT id FROM app.events WHERE id <= 1234;"})
+	if n := strings.Count(string(body), "\r\n"); n != 1235 || !strings.Contains(h.Get("Content-Disposition"), "query-") {
+		t.Errorf("sql export: %d lines", n)
+	}
+	if _, _, body = e.export(ctx, ExportReq{SQL: "SELECT 1 AS a WHERE false"}); string(body) != "a\r\n" {
+		t.Errorf("empty export: %q", body)
+	}
+	// Read-only, multi-statement and no-row statements are refused with a JSON error.
+	for _, sql := range []string{"DELETE FROM public.logs", "SELECT 1; DELETE FROM public.logs", "SET search_path = public"} {
+		if status, h, _ := e.export(ctx, ExportReq{SQL: sql}); status == 200 || h.Get("Content-Type") != "application/json" {
+			t.Errorf("%q: %d %s", sql, status, h.Get("Content-Type"))
+		}
+	}
+
+	// Aborting a download cancels the query in Postgres.
+	actx, cancel := context.WithCancel(ctx)
+	go func() { time.Sleep(500 * time.Millisecond); cancel() }()
+	b, _ := json.Marshal(ExportReq{SQL: "SELECT * FROM app.events, generate_series(1, 100)"})
+	r, _ := http.NewRequestWithContext(actx, "POST", e.url+"/api/c/"+e.conn+"/fixture_a/export",
+		strings.NewReader(url.Values{"req": {string(b)}}.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: "open_tableplus", Value: e.token})
+	if res, err := http.DefaultClient.Do(r); err == nil {
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for psql(t, "fixture_a", "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'open-tableplus-test' AND state = 'active' AND query LIKE '%generate_series(1, 100)%'") != "0" {
+		if time.Now().After(deadline) {
+			t.Fatal("export query still running after the download was aborted")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func TestStructure(t *testing.T) {
+	e := setup(t)
+	get := func(table string) map[string]Result {
+		var s map[string]Result
+		e.must("GET", "/api/c/"+e.conn+"/fixture_a/structure?schema=app&table="+table, nil, &s)
+		return s
+	}
+	users, events := get("users"), get("events")
+	cols := users["columns"]
+	if len(cols.Rows) != 9 || *cols.Rows[0][0] != "id" || *cols.Rows[0][4] != "yes" || *cols.Rows[3][1] != "numeric(38,10)" ||
+		*cols.Rows[1][2] != "not null" || *cols.Rows[5][3] != "true" || cols.Rows[4][3] != nil {
+		t.Errorf("users columns: %+v", cols.Rows)
+	}
+	all := func(r Result) string {
+		var out []string
+		for _, row := range r.Rows {
+			for _, v := range row {
+				if v != nil {
+					out = append(out, *v)
+				}
+			}
+		}
+		return strings.Join(out, " | ")
+	}
+	if s := all(events["indexes"]); !strings.Contains(s, "events_pkey") || !strings.Contains(s, "(user_id, kind)") {
+		t.Errorf("indexes: %s", s)
+	}
+	if s := all(events["foreignKeys"]); !strings.Contains(s, "events_user_fk") || !strings.Contains(s, "REFERENCES app.users(id)") {
+		t.Errorf("foreign keys: %s", s)
+	}
+	if s := all(users["referencedBy"]); !strings.Contains(s, "app.events") || !strings.Contains(s, "events_user_fk") {
+		t.Errorf("referenced by: %s", s)
+	}
+	if status, _, _ := e.call(context.Background(), "GET", "/api/c/"+e.conn+"/fixture_a/structure?schema=app&table=nope", nil); status == 200 {
+		t.Error("missing table answered 200")
+	}
+
+	// Environment label round-trips and is validated.
+	var c ConnView
+	e.must("PUT", "/api/conns", Conn{Name: "p", Host: "h", Env: "prod"}, &c)
+	if c.Env != "prod" {
+		t.Errorf("env: %+v", c)
+	}
+	if status, _, _ := e.call(context.Background(), "PUT", "/api/conns", Conn{Name: "p", Host: "h", Env: "live"}); status != 400 {
+		t.Errorf("bad env accepted: %d", status)
+	}
+}
+
+func TestHistory(t *testing.T) {
+	e := setup(t)
+	hist := func(db string) []HistoryEntry {
+		var h []HistoryEntry
+		e.must("GET", "/api/c/"+e.conn+"/"+db+"/history", nil, &h)
+		return h
+	}
+	if h := hist("fixture_a"); h == nil || len(h) != 0 {
+		t.Fatalf("empty history should be []: %v", h)
+	}
+	e.sql("SELECT 1")
+	e.sql("SELECT * FROM nope")
+	e.sql("  SELECT 1  ") // a repeat moves to the top (trimmed)
+	h := hist("fixture_a")
+	if len(h) != 2 || h[0].SQL != "SELECT 1" || !h[0].OK || h[0].Info[:8] != "SELECT 1" ||
+		h[1].SQL != "SELECT * FROM nope" || h[1].OK || h[1].Info != "42P01" || h[0].At < h[1].At {
+		t.Errorf("history: %+v", h)
+	}
+
+	// A cancelled run isn't recorded.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	e.call(ctx, "POST", "/api/c/"+e.conn+"/fixture_a/sql", map[string]string{"sql": "SELECT pg_sleep(5)"})
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+	if h := hist("fixture_a"); len(h) != 2 {
+		t.Errorf("cancelled run recorded: %+v", h[0])
+	}
+
+	// Capped at 100, and kept per database.
+	for i := 0; i < 120; i++ {
+		e.sql(fmt.Sprintf("SELECT %d", i))
+	}
+	if h := hist("fixture_a"); len(h) != historyCap || h[0].SQL != "SELECT 119" {
+		t.Errorf("cap: %d entries, newest %q", len(h), h[0].SQL)
+	}
+	if h := hist("fixture_b"); len(h) != 0 {
+		t.Errorf("fixture_b shares history: %d", len(h))
+	}
+
+	// On disk, 0600, and survives a restart; deleting the connection deletes it.
+	dir := e.dir
+	st, err := os.Stat(dir + "/history.json")
+	if err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("history.json: %v %v", st, err)
+	}
+	reopened, err := OpenStore(dir)
+	if err != nil || len(reopened.History(e.conn+"/fixture_a")) != historyCap {
+		t.Fatalf("history lost on restart: %v", err)
+	}
+	e.must("DELETE", "/api/conns/"+e.conn, nil, nil)
+	if h := hist("fixture_a"); len(h) != 0 {
+		t.Errorf("history kept after deleting the connection: %d", len(h))
+	}
+	if b, _ := os.ReadFile(dir + "/history.json"); strings.Contains(string(b), e.conn) {
+		t.Error("history.json still mentions the deleted connection")
 	}
 }

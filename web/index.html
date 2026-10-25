@@ -13,6 +13,7 @@
       <button id="editConn" title="Edit connection" aria-label="Edit connection">✎</button>
       <button id="newConn" title="New connection" aria-label="New connection">+</button>
     </div>
+    <span id="env" hidden></span>
     <select id="db" aria-label="Database"></select>
     <input id="filterTables" type="search" placeholder="Filter tables…" aria-label="Filter tables">
     <p id="sideMsg" class="err" role="status" hidden></p>
@@ -41,6 +42,11 @@
           <option>prefer</option><option>disable</option><option>require</option><option>verify-full</option>
         </select>
       </label>
+      <label>Environment
+        <select name="env">
+          <option value="">none</option><option>dev</option><option>staging</option><option>prod</option>
+        </select>
+      </label>
       <p id="dlgMsg" role="status"></p>
       <div class="row">
         <button type="button" id="dlgTest">Test</button>
@@ -52,6 +58,7 @@
     </form>
   </dialog>
 
+  <iframe name="dl" id="dl" hidden></iframe>
   <script src="app.js"></script>
 </body>
 </html>

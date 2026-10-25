@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +27,7 @@ const (
 	poolMaxConns   = 4
 	connectTimeout = 5 * time.Second
 	requestTimeout = 35 * time.Second // backstop; statement_timeout below fires first
+	exportTimeout  = 11 * time.Minute // exports raise statement_timeout to 10 minutes
 )
 
 // appName identifies our sessions in pg_stat_activity.
@@ -328,8 +332,103 @@ type RowsReq struct {
 
 var compareOps = map[string]bool{"=": true, "!=": true, "<": true, "<=": true, ">": true, ">=": true}
 
-// Rows returns one page of a table or view. Column names are checked against
-// the catalog and quoted; every user value is a parameter.
+// tableQuery builds the SELECT for a table view (search, filters, sort).
+// Column names are checked against the catalog and quoted; every user value
+// is a parameter.
+func tableQuery(ctx context.Context, pc *pgconn.PgConn, req RowsReq) (sql string, args []string, cols []Column, total int64, err error) {
+	var meta Result
+	err = query(ctx, pc, `
+		SELECT a.attname, format_type(a.atttypid, a.atttypmod),
+		       COALESCE(a.attnum = ANY(i.indkey), false)::text, c.reltuples::bigint
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+		LEFT JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary
+		WHERE n.nspname = $1 AND c.relname = $2
+		ORDER BY a.attnum`, []string{req.Schema, req.Table}, 10000, &meta)
+	if err != nil {
+		return
+	}
+	if len(meta.Rows) == 0 {
+		err = notFound("table " + req.Schema + "." + req.Table)
+		return
+	}
+	cols = make([]Column, len(meta.Rows))
+	byName := map[string]Column{}
+	var names, pks []string
+	for i, r := range meta.Rows {
+		cols[i] = Column{Name: *r[0], Type: *r[1], PK: *r[2] == "true"}
+		byName[cols[i].Name] = cols[i]
+		names = append(names, ident(cols[i].Name))
+		if cols[i].PK {
+			pks = append(pks, ident(cols[i].Name))
+		}
+	}
+	total, _ = strconv.ParseInt(*meta.Rows[0][3], 10, 64)
+
+	var where []string
+	arg := func(v string) string { args = append(args, v); return "$" + strconv.Itoa(len(args)) }
+	if q := strings.TrimSpace(req.Q); q != "" {
+		p := arg("%" + likeEscape(q) + "%")
+		var ors []string
+		for _, n := range names {
+			ors = append(ors, n+"::text ILIKE "+p)
+		}
+		where = append(where, "("+strings.Join(ors, " OR ")+")")
+	}
+	for _, f := range req.Filters {
+		col, ok := byName[f.Col]
+		if !ok {
+			err = userErr("unknown column " + strconv.Quote(f.Col))
+			return
+		}
+		c := ident(col.Name)
+		switch {
+		case compareOps[f.Op]:
+			where = append(where, c+" "+f.Op+" "+arg(f.Val)+"::"+col.Type)
+		case f.Op == "contains":
+			where = append(where, c+"::text ILIKE "+arg("%"+likeEscape(f.Val)+"%"))
+		case f.Op == "is null":
+			where = append(where, c+" IS NULL")
+		case f.Op == "is not null":
+			where = append(where, c+" IS NOT NULL")
+		default:
+			err = userErr("unknown operator " + strconv.Quote(f.Op))
+			return
+		}
+	}
+
+	var order []string
+	if req.Sort != "" {
+		col, ok := byName[req.Sort]
+		if !ok {
+			err = userErr("unknown column " + strconv.Quote(req.Sort))
+			return
+		}
+		dir := " ASC NULLS LAST"
+		if req.Desc {
+			dir = " DESC NULLS LAST"
+		}
+		order = append(order, ident(col.Name)+dir)
+	}
+	for _, pk := range pks { // tiebreaker keeps pages stable
+		if req.Sort == "" || pk != ident(req.Sort) {
+			order = append(order, pk)
+		}
+	}
+
+	sql = "SELECT " + strings.Join(names, ", ") + " FROM " + pgx.Identifier{req.Schema, req.Table}.Sanitize()
+	if len(where) > 0 {
+		sql += " WHERE " + strings.Join(where, " AND ")
+		total = 0 // the estimate is for the whole table
+	}
+	if len(order) > 0 {
+		sql += " ORDER BY " + strings.Join(order, ", ")
+	}
+	return
+}
+
+// Rows returns one page of a table or view.
 func Rows(ctx context.Context, pool *pgxpool.Pool, req RowsReq) (*Result, error) {
 	if req.Page < 0 || req.Page > 1_000_000 {
 		return nil, userErr("bad page")
@@ -337,103 +436,127 @@ func Rows(ctx context.Context, pool *pgxpool.Pool, req RowsReq) (*Result, error)
 	start := time.Now()
 	res := &Result{}
 	err := readOnly(ctx, pool, func(pc *pgconn.PgConn) error {
-		var meta Result
-		err := query(ctx, pc, `
-			SELECT a.attname, format_type(a.atttypid, a.atttypmod),
-			       COALESCE(a.attnum = ANY(i.indkey), false)::text, c.reltuples::bigint
-			FROM pg_class c
-			JOIN pg_namespace n ON n.oid = c.relnamespace
-			JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
-			LEFT JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary
-			WHERE n.nspname = $1 AND c.relname = $2
-			ORDER BY a.attnum`, []string{req.Schema, req.Table}, 10000, &meta)
+		sql, args, cols, total, err := tableQuery(ctx, pc, req)
 		if err != nil {
 			return err
 		}
-		if len(meta.Rows) == 0 {
-			return notFound("table " + req.Schema + "." + req.Table)
-		}
-		cols := make([]Column, len(meta.Rows))
-		byName := map[string]Column{}
-		var names, pks []string
-		for i, r := range meta.Rows {
-			cols[i] = Column{Name: *r[0], Type: *r[1], PK: *r[2] == "true"}
-			byName[cols[i].Name] = cols[i]
-			names = append(names, ident(cols[i].Name))
-			if cols[i].PK {
-				pks = append(pks, ident(cols[i].Name))
-			}
-		}
-		total, _ := strconv.ParseInt(*meta.Rows[0][3], 10, 64)
-
-		var where, args []string
-		arg := func(v string) string { args = append(args, v); return "$" + strconv.Itoa(len(args)) }
-		if q := strings.TrimSpace(req.Q); q != "" {
-			p := arg("%" + likeEscape(q) + "%")
-			var ors []string
-			for _, n := range names {
-				ors = append(ors, n+"::text ILIKE "+p)
-			}
-			where = append(where, "("+strings.Join(ors, " OR ")+")")
-		}
-		for _, f := range req.Filters {
-			col, ok := byName[f.Col]
-			if !ok {
-				return userErr("unknown column " + strconv.Quote(f.Col))
-			}
-			c := ident(col.Name)
-			switch {
-			case compareOps[f.Op]:
-				where = append(where, c+" "+f.Op+" "+arg(f.Val)+"::"+col.Type)
-			case f.Op == "contains":
-				where = append(where, c+"::text ILIKE "+arg("%"+likeEscape(f.Val)+"%"))
-			case f.Op == "is null":
-				where = append(where, c+" IS NULL")
-			case f.Op == "is not null":
-				where = append(where, c+" IS NOT NULL")
-			default:
-				return userErr("unknown operator " + strconv.Quote(f.Op))
-			}
-		}
-
-		var order []string
-		if req.Sort != "" {
-			col, ok := byName[req.Sort]
-			if !ok {
-				return userErr("unknown column " + strconv.Quote(req.Sort))
-			}
-			dir := " ASC NULLS LAST"
-			if req.Desc {
-				dir = " DESC NULLS LAST"
-			}
-			order = append(order, ident(col.Name)+dir)
-		}
-		for _, pk := range pks { // tiebreaker keeps pages stable
-			if req.Sort == "" || pk != ident(req.Sort) {
-				order = append(order, pk)
-			}
-		}
-
-		sql := "SELECT " + strings.Join(names, ", ") + " FROM " + pgx.Identifier{req.Schema, req.Table}.Sanitize()
-		if len(where) > 0 {
-			sql += " WHERE " + strings.Join(where, " AND ")
-		}
-		if len(order) > 0 {
-			sql += " ORDER BY " + strings.Join(order, ", ")
-		}
-		sql += fmt.Sprintf(" LIMIT %d OFFSET %d", pageSize+1, req.Page*pageSize)
-
 		res.Columns = cols
-		if err := query(ctx, pc, sql, args, pageSize, res); err != nil {
-			return err
-		}
-		if len(where) == 0 && total > 0 { // views and never-analyzed tables have no estimate
+		if total > 0 { // views, never-analyzed tables and filtered views have no estimate
 			res.Total = &total
 		}
-		return nil
+		return query(ctx, pc, sql+fmt.Sprintf(" LIMIT %d OFFSET %d", pageSize+1, req.Page*pageSize), args, pageSize, res)
 	})
 	res.Ms = time.Since(start).Milliseconds()
 	return res, err
+}
+
+// ExportReq is either SQL or a table view.
+type ExportReq struct {
+	SQL string `json:"sql"`
+	RowsReq
+}
+
+// Export streams every row of a table view or query as CSV, without the UI's
+// row and cell caps. begin is called once the first row (or the end of an
+// empty result) arrives; an error before that is an ordinary API error.
+func Export(ctx context.Context, pool *pgxpool.Pool, req ExportReq, begin func() io.Writer) error {
+	return readOnly(ctx, pool, func(pc *pgconn.PgConn) error {
+		if _, err := pc.Exec(ctx, "SET LOCAL statement_timeout = '10min'").ReadAll(); err != nil {
+			return err
+		}
+		sql, args := strings.TrimRight(strings.TrimSpace(req.SQL), "; \t\r\n"), []string(nil)
+		if sql == "" {
+			var err error
+			if sql, args, _, _, err = tableQuery(ctx, pc, req.RowsReq); err != nil {
+				return err
+			}
+		}
+		params := make([][]byte, len(args))
+		for i, a := range args {
+			params[i] = []byte(a)
+		}
+		rr := pc.ExecParams(ctx, sql, params, nil, nil, nil)
+		var w *bufio.Writer
+		start := func() {
+			w = bufio.NewWriterSize(begin(), 64<<10)
+			var header [][]byte
+			for _, fd := range rr.FieldDescriptions() {
+				header = append(header, []byte(fd.Name))
+			}
+			writeCSVRow(w, header)
+		}
+		for rr.NextRow() {
+			if w == nil {
+				start()
+			}
+			writeCSVRow(w, rr.Values())
+		}
+		if _, err := rr.Close(); err != nil {
+			return err
+		}
+		if w == nil {
+			if len(rr.FieldDescriptions()) == 0 {
+				return userErr("nothing to export: the statement returns no rows")
+			}
+			start()
+		}
+		return w.Flush()
+	})
+}
+
+// writeCSVRow writes one RFC 4180 record. NULL is an empty field and the
+// empty string is "", so the two stay distinct.
+func writeCSVRow(w *bufio.Writer, vals [][]byte) {
+	for i, v := range vals {
+		if i > 0 {
+			w.WriteByte(',')
+		}
+		if v != nil && (len(v) == 0 || bytes.ContainsAny(v, ",\"\r\n")) {
+			w.WriteByte('"')
+			w.Write(bytes.ReplaceAll(v, []byte(`"`), []byte(`""`)))
+			w.WriteByte('"')
+		} else {
+			w.Write(v)
+		}
+	}
+	w.WriteString("\r\n")
+}
+
+var structureQueries = []struct{ name, sql string }{
+	{"columns", `SELECT a.attname AS column, format_type(a.atttypid, a.atttypmod) AS type,
+		CASE WHEN a.attnotnull THEN 'not null' ELSE 'null' END AS nullable,
+		pg_get_expr(d.adbin, d.adrelid) AS default,
+		CASE WHEN a.attnum = ANY(i.indkey) THEN 'yes' ELSE '' END AS primary_key
+		FROM pg_attribute a
+		LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+		LEFT JOIN pg_index i ON i.indrelid = a.attrelid AND i.indisprimary
+		WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum`},
+	{"indexes", `SELECT c.relname AS index, pg_get_indexdef(i.indexrelid) AS definition
+		FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE i.indrelid = $1::regclass ORDER BY 1`},
+	{"foreignKeys", `SELECT conname AS name, pg_get_constraintdef(oid) AS definition
+		FROM pg_constraint WHERE conrelid = $1::regclass AND contype = 'f' ORDER BY 1`},
+	{"referencedBy", `SELECT conrelid::regclass::text AS from_table, conname AS name, pg_get_constraintdef(oid) AS definition
+		FROM pg_constraint WHERE confrelid = $1::regclass AND contype = 'f' ORDER BY 1, 2`},
+}
+
+// Structure describes a table: columns, indexes and foreign keys both ways.
+func Structure(ctx context.Context, pool *pgxpool.Pool, schema, table string) (map[string]*Result, error) {
+	out := map[string]*Result{}
+	err := readOnly(ctx, pool, func(pc *pgconn.PgConn) error {
+		for _, q := range structureQueries {
+			res := &Result{}
+			fds, err := run(ctx, pc, q.sql, []string{ident(schema) + "." + ident(table)}, 10000, res)
+			if err == nil {
+				err = describe(ctx, pc, fds, res)
+			}
+			if err != nil {
+				return err
+			}
+			out[q.name] = res
+		}
+		return nil
+	})
+	return out, err
 }
 
 func ident(s string) string { return pgx.Identifier{s}.Sanitize() }

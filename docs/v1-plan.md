@@ -1,7 +1,8 @@
 # Open TablePlus — v1 Spec (Go)
 
-**Date:** 24 October 2026
+**Date:** 24 October 2026 · **Architecture sections (§3–§7) kept current through v0.3**
 **Supersedes for v1:** `product-spec.md` §6–§8 (the long-term vision there still stands)
+**See also:** `v0.3-plan.md` (current release), `STATUS.md` (where things stand)
 
 ## 1. v1 in one sentence
 
@@ -33,7 +34,7 @@ browser ──HTTP/JSON──▶ open-tableplus (127.0.0.1:7777, single binary, 
 - **Go stdlib** `net/http` (1.22+ pattern routing) and `embed`. **One dependency:** `github.com/jackc/pgx/v5`.
 - **User SQL runs through `pgconn.ExecParams`** (the extended protocol). Postgres then refuses multi-statement strings, so `SELECT 1; COMMIT; DELETE …` can't sneak past the read-only transaction.
 - **Frontend:** `index.html` + `app.js` + `app.css`, vanilla JS, no build. The grid is a plain `<table>` (≤ 500 rows).
-- **State:** `~/.config/open-tableplus/` holds `connections.json` and `token` (both `0600`, written atomically). Nothing else, so restarting is free.
+- **State:** `~/.config/open-tableplus/` holds `connections.json`, `history.json` (from v0.3) and `token`, all `0600` and written atomically. Open tabs live in browser localStorage. Nothing else, so restarting is free.
 - **Infra:** none. `go build && ./open-tableplus`. Dev/test Postgres is a throwaway `initdb` cluster on port 55432 (`scripts/devdb.sh`). It never touches your own databases.
 
 Budget: **< 1,500 lines** of app code for v1. From v0.3 through v0.5 the cap is **< 2,000 lines** of app code (tests excluded), with an audit before each release.
@@ -50,6 +51,7 @@ Budget: **< 1,500 lines** of app code for v1. From v0.3 through v0.5 the cap is 
 | Cancel | The browser aborts the `fetch`, the request context is cancelled, pgx sends a Postgres CancelRequest, and the connection is closed if the server doesn't respond within 2s. No cancel endpoint. |
 | Accidental write | Every request runs in `BEGIN READ ONLY … ROLLBACK`, and `default_transaction_read_only=on` is set when connecting. Postgres enforces it. For production, also use a read-only role. |
 | Leaked connections | `MaxConns 4`, `MaxConnIdleTime 60s`, `idle_in_transaction_session_timeout=60s`, rollback in `defer`. |
+| Session leftovers | `ROLLBACK` doesn't undo session advisory locks or `PREPARE`. pgxpool's `AfterRelease` hook runs `DISCARD ALL` before a connection is reused (async, off the request path). Settings applied when connecting survive it. (v0.2.1) |
 | Handler panic | `net/http` recovers each request. Responses are always JSON `{error}`. |
 | Connection edited or deleted | Its pools are closed and removed from the map. |
 
@@ -69,15 +71,20 @@ Filter values go to Postgres as untyped text parameters cast to the column's cat
 ## 7. API
 
 ```
-GET    /api/conns                     list (no passwords)
-PUT    /api/conns                     create/update {id?, name, host, port, user, password?, database, sslmode}
-DELETE /api/conns/{id}
-POST   /api/conns/{id}/test
+GET    /api/conns                     list (no passwords; hasPassword instead)
+PUT    /api/conns                     create/update {id?, name, host, port, user, password?, database, sslmode, env}
+DELETE /api/conns/{id}                also deletes its history and closes its pools
+POST   /api/conns/test                {connection fields}; blank password = use the saved one
 GET    /api/c/{id}/dbs
 GET    /api/c/{id}/{db}/tree          schemas, tables/views, reltuples estimate
-POST   /api/c/{id}/{db}/rows          {schema, table, q, filters[], sort, desc, page}
-POST   /api/c/{id}/{db}/sql           {sql}
+POST   /api/c/{id}/{db}/rows          {schema, table, q, filters[], sort, desc, page} → {columns, rows, cut, more, approxTotal, ms}
+POST   /api/c/{id}/{db}/sql           {sql} → {columns, rows, cut, more, tag, ms}; recorded in history
+GET    /api/c/{id}/{db}/history       v0.3: newest first, max 100
+GET    /api/c/{id}/{db}/structure     v0.3: ?schema=&table= → {columns, indexes, foreignKeys, referencedBy}
+POST   /api/c/{id}/{db}/export        v0.3: form field req = rows request or {sql} → streamed CSV attachment
 ```
+
+Errors are JSON `{error, code?, detail?, hint?, position?}`. Postgres errors return 422, bad input 400, an unreachable DB 502, a timeout 504.
 
 Row paging: `LIMIT 101 OFFSET page*100`, ordered by the chosen column with the primary key as tiebreaker so pages stay stable. Totals come from `reltuples`, never `COUNT(*)`.
 
@@ -104,7 +111,7 @@ Row paging: `LIMIT 101 OFFSET page*100`, ordered by the chosen column with the p
 **Fault tolerance**
 - Restart Postgres mid-session: the server keeps running, and the next request after the DB returns succeeds.
 - `SELECT pg_sleep(60)` + client abort: the backend's query is cancelled within ~1s.
-- `SELECT * FROM big` → 500 rows, `truncated: true`.
+- `SELECT * FROM big` → 500 rows, `more: true`.
 - `DELETE`, `CREATE`, `SELECT 1; DELETE …` → refused.
 - After 50 abort/error cycles, `pg_stat_activity` shows ≤ 4 sessions per pool.
 
