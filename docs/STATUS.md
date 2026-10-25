@@ -5,14 +5,13 @@
 ## Where things stand
 
 - **Repo:** https://github.com/manan-paneri-99/open-tableplus (public). The local folder is still named `apna-tableplus`; the product name is open-tableplus everywhere else.
-- **`main`** = **v0.2.1**, released and marked Latest.
+- **`main`** = **v0.3.0**, released and marked Latest.
 - **Releases:**
+  - v0.3.0: copy as TSV, streamed CSV export, server-side query history, environment labels, structure view.
   - v0.2.1: pooled sessions are reset with `DISCARD ALL`; README roadmap.
   - v0.2.0: tabs, and search/filters run on Enter.
   - v0.1.0: marked pre-release; it crashes on filters that match no rows.
-- **Open: PR #3**, branch `v0.3-data-out`, CI green. It contains all of v0.3: copy, CSV export, server-side query history, environment labels and the structure view.
-  - **Don't merge it until the user says so.** They asked to hold it.
-  - Once they approve: merge, run the pre-release audit (line budget), then tag `v0.3.0` on `main`.
+- **Open PRs:** none.
 - **Size:** app code (`*.go` excluding tests, plus `web/`) is 1,854 lines, against a budget of 2,000 through v0.5. Tests are about 690 lines.
 
 ## How to work on it
@@ -70,8 +69,7 @@ See `CLAUDE.md` for commands and conventions. The release flow:
 
 ## Next steps
 
-1. **v0.3:** wait for the user's review of PR #3, then merge, audit and tag `v0.3.0`.
-2. **v0.4, safe editing:** write `docs/v0.4-plan.md` first, in the same format as `v0.3-plan.md`. Scope comes from the README roadmap and `product-spec.md` Phase 2:
+1. **v0.4, safe editing:** write `docs/v0.4-plan.md` first, in the same format as `v0.3-plan.md`. Scope comes from the README roadmap and `product-spec.md` Phase 2:
    - opt-in per connection;
    - edit, insert and delete only on tables with a primary key;
    - review pending changes before applying;
@@ -79,4 +77,4 @@ See `CLAUDE.md` for commands and conventions. The release flow:
    - an extra confirmation when the connection's `env` is `prod`.
 
    This is the first feature that writes, so the read-only guarantees need a deliberate, tested exception that only the edit endpoint can use.
-3. **Later:** v0.5 SSH/TLS; then syntax highlighting, saved queries, grid keyboard navigation, Firefox/Safari checks, signed binaries and Homebrew, and MySQL/SQLite.
+2. **Later:** v0.5 SSH/TLS; then syntax highlighting, saved queries, grid keyboard navigation, Firefox/Safari checks, signed binaries and Homebrew, and MySQL/SQLite.

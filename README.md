@@ -71,8 +71,6 @@ Read-only and reliable first, then writes, then reach. App code (excluding tests
 - **v0.1:** browse and search Postgres, multiple connections and databases, a read-only SQL box with cancel, and a single binary for macOS, Windows and Linux.
 - **v0.2:** tabs with independent search, filters and results (no tab or filter limits); search runs on Enter.
 - **v0.2.1:** pooled connections are reset between requests, so locks and prepared statements can't leak.
-
-**In review (PR #3)**
 - **v0.3: Get data out.**
   - Copy a block of cells as TSV.
   - Streamed CSV export of a table view or a query, with every row and full values.
