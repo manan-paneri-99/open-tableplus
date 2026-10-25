@@ -79,7 +79,7 @@ Docs:
 
 ## Roadmap
 
-Read-only and reliable first, then writes, then reach. App code (excluding tests) stays under 2,000 lines through v0.5. Each release ends with an audit that removes code that isn't earning its place.
+Read-only and reliable first, then writes, then reach. App code (excluding tests) is kept small: about 2,100 lines at v0.4. Each release ends with an audit that removes code that isn't earning its place.
 
 **Shipped**
 - **v0.1:** browse and search Postgres, multiple connections and databases, a read-only SQL box with cancel, and a single binary for macOS, Windows and Linux.

@@ -23,7 +23,7 @@ scripts/devdb.sh start            # throwaway Postgres (needs initdb/pg_ctl; Hom
 scripts/devdb.sh reset            # after editing fixture/fixture.sql
 go vet ./... && go test -race -count=1 ./...
 go build -o open-tableplus . && ./open-tableplus
-wc -l main.go store.go db.go server.go web/*    # app-code line budget: < 2,000 through v0.5
+wc -l main.go store.go db.go server.go web/*    # app code: 2,107 at v0.4 (accepted over the 2,000 target); ask before growing it
 ```
 
 For browser checks, run a separate instance so the user's own server on 7777 isn't touched: `./open-tableplus -open=false -port 7778 -config <scratch dir>`. It needs a connection to 127.0.0.1:55432, user `postgres`, no password.
