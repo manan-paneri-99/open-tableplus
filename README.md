@@ -31,7 +31,7 @@ Optionally back up first: `cp -R ~/.config/open-tableplus ~/.config/open-tablepl
 
 | Data | Where | Kept across upgrades |
 |---|---|---|
-| Connections and passwords | `~/.config/open-tableplus/connections.json` | yes |
+| Connections, passwords, environment and editing settings | `~/.config/open-tableplus/connections.json` | yes |
 | Query history (v0.3+) | `~/.config/open-tableplus/history.json` | yes |
 | Access token | `~/.config/open-tableplus/token` | yes, so you stay signed in |
 | Open tabs and editor text | browser storage for `http://127.0.0.1:7777` | yes, if you keep the same port |
@@ -47,7 +47,20 @@ scripts/release.sh v0.1.0   # all platforms → dist/, with SHA256SUMS
 
 Connections and query history are saved in `~/.config/open-tableplus/` (`connections.json`, `history.json`, both mode 0600). Leave the password blank to use `~/.pgpass`.
 
-Every query runs inside a `READ ONLY` transaction, so Postgres refuses writes. The one exception is grid editing (v0.4), which is off unless you tick "Allow editing" on a connection, and only writes the changes you review and apply. For production databases, also connect with a read-only role.
+Every query runs inside a `READ ONLY` transaction, so Postgres refuses writes. The one exception is grid editing (v0.4), below. For production databases you only browse, also connect with a read-only role.
+
+## Editing (v0.4)
+
+Editing is off for every connection until you tick **Allow editing** in its settings. The SQL box stays read-only either way.
+
+- It works on tables with a primary key. Views, and tables without one, stay read-only and say why.
+- Click a cell to change it (**Set**, **Set NULL**). **+ Row** adds a row, where untouched columns get their default. **Delete rows** marks the selected rows, and pressing it again restores them.
+- Nothing is written until you press **Apply**. Until then, pending changes are highlighted and listed, and you can revert each one or discard them all.
+- Apply runs every change in one transaction, so either all of them land or none do. If someone else changed or deleted one of the rows since you loaded it, the apply fails and nothing is written. Reload and try again.
+- On a connection labelled `prod`, Apply asks once more.
+- Values cut at 10 KB in the grid can't be edited there.
+
+Going back to a version before v0.4 turns editing off: an older binary ignores the setting and drops it the next time it saves any connection.
 
 ## Development
 
@@ -60,7 +73,8 @@ scripts/devdb.sh reset      # wipe and reseed
 Docs:
 - [docs/STATUS.md](docs/STATUS.md): current state, decisions, next steps.
 - [docs/v1-plan.md](docs/v1-plan.md): architecture and API.
-- [docs/v0.3-plan.md](docs/v0.3-plan.md): current release spec.
+- [docs/v0.4-plan.md](docs/v0.4-plan.md): current release spec (editing).
+- [docs/v0.3-plan.md](docs/v0.3-plan.md): the v0.3 spec.
 - [docs/product-spec.md](docs/product-spec.md): the original vision.
 
 ## Roadmap

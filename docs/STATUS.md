@@ -11,7 +11,7 @@
   - v0.2.1: pooled sessions are reset with `DISCARD ALL`; README roadmap.
   - v0.2.0: tabs, and search/filters run on Enter.
   - v0.1.0: marked pre-release; it crashes on filters that match no rows.
-- **Open: PR #4**, branch `status-v0.3.0`: these docs plus all of v0.4 (safe editing, see `docs/v0.4-plan.md`). Not merged or tagged; wait for the user.
+- **Open: PR #4**, branch `status-v0.3.0`: v0.3.0 docs plus all of v0.4 (safe editing; spec in `docs/v0.4-plan.md`, user guide in the README "Editing" section). CI green. Not merged or tagged; wait for the user.
 - **Size:** app code (`*.go` excluding tests, plus `web/`) is **2,107 lines, over the 2,000 budget** (v0.3.0 was 1,854; editing added ~250). The user must decide: raise the budget, or cut scope. Tests are about 785 lines.
 
 ## How to work on it

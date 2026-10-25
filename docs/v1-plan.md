@@ -2,7 +2,7 @@
 
 **Date:** 24 October 2026 · **Architecture sections (§3–§7) kept current through v0.3**
 **Supersedes for v1:** `product-spec.md` §6–§8 (the long-term vision there still stands)
-**See also:** `v0.3-plan.md` (current release), `STATUS.md` (where things stand)
+**See also:** `v0.3-plan.md`, `v0.4-plan.md` (current release), `STATUS.md` (where things stand)
 
 ## 1. v1 in one sentence
 
