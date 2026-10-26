@@ -12,7 +12,7 @@
   - v0.2.0: tabs, and search/filters run on Enter.
   - v0.1.0: marked pre-release; it crashes on filters that match no rows.
 - **Open: PR #4**, branch `status-v0.3.0`: v0.3.0 docs plus all of v0.4 (safe editing; spec in `docs/v0.4-plan.md`, user guide in the README "Editing" section). CI green. Not merged or tagged; wait for the user.
-- **Size:** app code (`*.go` excluding tests, plus `web/`) is **2,107 lines**. The budget was 2,000; on 25 October 2026 the user accepted 2,107 for v0.4 (v0.3.0 was 1,854; editing added ~250). There's no new number for v0.5 yet, so ask before growing further. Tests are about 785 lines.
+- **Size:** app code (`*.go` excluding tests, plus `web/`) is **2,133 lines**. The budget was 2,000; on 25 October 2026 the user accepted 2,107 for v0.4 (v0.3.0 was 1,854; editing added ~250). The row side panel (26 October) added 26 more, not yet signed off; dropping its per-field Copy buttons is the obvious trim. There's no new number for v0.5 yet, so ask before growing further. Tests are about 785 lines.
 
 ## How to work on it
 
@@ -43,7 +43,7 @@ See `CLAUDE.md` for commands and conventions. The release flow:
 ## Gaps vs the original `product-spec.md`
 
 - **Phase 1 (read-only explorer):** complete once v0.3 merges, except **syntax highlighting**.
-- **Phase 2 (safe editing):** built in PR #4 (v0.4); not released yet.
+- **Phase 2 (safe editing):** built in PR #4 (v0.4), including a row side panel for copying and editing a row; not released yet.
 - **Phase 3 (polish):** missing **saved queries** and a **diagnostics view**.
 - **Phase 4:** SSH/TLS is v0.5; other engines are "Later"; import, backup and ER diagrams are not planned.
 - **Non-functional requirements:**
@@ -70,5 +70,5 @@ See `CLAUDE.md` for commands and conventions. The release flow:
 
 ## Next steps
 
-1. **v0.4, safe editing:** built in PR #4 (`docs/v0.4-plan.md`). Get the user's review (2,107 lines is accepted), then merge and tag `v0.4.0`. Only `Edit` in `db.go` opens a `READ WRITE` transaction, and only when the connection has `editable` set.
+1. **v0.4, safe editing:** built in PR #4 (`docs/v0.4-plan.md`). Get the user's review (2,107 lines accepted; now 2,133 with the row panel), then merge and tag `v0.4.0`. Only `Edit` in `db.go` opens a `READ WRITE` transaction, and only when the connection has `editable` set.
 2. **Later:** v0.5 SSH/TLS; then syntax highlighting, saved queries, grid keyboard navigation, Firefox/Safari checks, signed binaries and Homebrew, and MySQL/SQLite.

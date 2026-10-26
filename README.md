@@ -54,7 +54,7 @@ Every query runs inside a `READ ONLY` transaction, so Postgres refuses writes. T
 Editing is off for every connection until you tick **Allow editing** in its settings. The SQL box stays read-only either way.
 
 - It works on tables with a primary key. Views, and tables without one, stay read-only and say why.
-- Click a cell to change it (**Set**, **Set NULL**). **+ Row** adds a row, where untouched columns get their default. **Delete rows** marks the selected rows, and pressing it again restores them.
+- Click a row to open it in the side panel: copy any field, type or paste new values, then **Save** (⌘/Ctrl+Enter) to stage them. **NULL** sets a field to NULL. Drag the panel's left edge to resize it; × or Esc closes it. **+ Row** adds a row, where untouched columns get their default. **Delete rows** marks the selected rows, and pressing it again restores them.
 - Nothing is written until you press **Apply**. Until then, pending changes are highlighted and listed, and you can revert each one or discard them all.
 - Apply runs every change in one transaction, so either all of them land or none do. If someone else changed or deleted one of the rows since you loaded it, the apply fails and nothing is written. Reload and try again.
 - On a connection labelled `prod`, Apply asks once more.

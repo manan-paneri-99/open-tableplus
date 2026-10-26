@@ -219,7 +219,7 @@ function buildTablePane(tab) {
   e.filters = h('div', { class: 'filters' });
   e.status = h('div', { class: 'status', role: 'status' });
   e.grid = h('div', { class: 'grid' });
-  e.cell = h('pre', { class: 'cell', hidden: true });
+  e.side = h('div', { class: 'side', hidden: true });
   e.dataBtn = h('button', { class: 'on', onclick: () => showStructure(tab, false) }, 'Data');
   e.structBtn = h('button', { onclick: () => showStructure(tab, true) }, 'Structure');
   e.tools = h('span', { class: 'row grow' }, e.q,
@@ -232,17 +232,16 @@ function buildTablePane(tab) {
   e.editNote = h('small', { class: 'status' });
   e.editBar = h('div', { class: 'row', hidden: true }, e.addRow, e.delRows, e.editNote);
   e.review = h('div', { class: 'review', hidden: true });
-  e.edit = h('div', { class: 'edit', hidden: true });
   e.pane = h('section', { class: 'pane' },
     h('div', { class: 'row' }, h('span', { class: 'seg' }, e.dataBtn, e.structBtn), e.tools),
-    e.filters, e.editBar, e.review, e.status, e.grid, e.structure, e.cell, e.edit);
+    e.filters, e.editBar, e.review, e.status, h('div', { class: 'body' }, e.grid, e.structure, grip(), e.side));
 }
 
 async function showStructure(tab, on) {
   const e = tab.el;
   e.dataBtn.classList.toggle('on', !on); e.structBtn.classList.toggle('on', on);
   e.tools.hidden = e.filters.hidden = e.grid.hidden = e.editBar.hidden = e.review.hidden = on;
-  e.structure.hidden = !on; e.cell.hidden = e.edit.hidden = true;
+  e.structure.hidden = !on; e.side.hidden = true;
   if (!on && tab.res) renderEdits(tab);
   if (!on || e.structure.childElementCount) return;
   setStatus(tab, 'Loading…');
@@ -306,7 +305,7 @@ function renderGrid(tab, res, sortable) {
   const g = tab.el.grid, fresh = res !== tab.res, x = g.scrollLeft, y = g.scrollTop;
   tab.res = res;
   g.replaceChildren(gridTable(tab, res, sortable, true));
-  if (fresh) { tab.sel = null; tab.el.cell.hidden = true; if (tab.el.edit) tab.el.edit.hidden = true; }
+  if (fresh) { tab.sel = null; tab.el.side.hidden = true; }
   g.scrollTo(fresh ? 0 : x, fresh ? 0 : y);
   if (tab.sel) paintSel(tab);
   if (sortable) renderEdits(tab);
@@ -336,10 +335,7 @@ function gridTable(tab, res, sortable, selectable) {
       return h('td', {
         class: [v == null && 'null', num[i] && 'num', cut.has(r + ',' + i) && 'cut', dirty && 'dirty'].filter(Boolean).join(' ') || null,
         onmousedown: (e) => { if (e.shiftKey) e.preventDefault(); }, // shift-click extends the cell selection, not a text selection
-        onclick: (e) => {
-          if (selectable) select(tab, r, i, e.shiftKey);
-          if (selectable && editable(tab)) editCell(tab, r, i); else showCell(tab, res.columns[i], v, cut.has(r + ',' + i));
-        },
+        onclick: (e) => { if (selectable) select(tab, r, i, e.shiftKey); showRow(tab, res, r, i); },
       }, v === undefined ? 'DEFAULT' : v === null ? 'NULL' : v.length > 300 ? v.slice(0, 300) : v);
     }));
   });
@@ -360,7 +356,7 @@ function paintSel(tab) {
     [...tr.children].forEach((td, ci) => td.classList.toggle('on', ri >= r0 && ri <= r1 && ci >= c0 && ci <= c1)));
 }
 
-// ⌘/Ctrl+C on a cell selection copies TSV; copying text in inputs or the cell viewer is left alone.
+// ⌘/Ctrl+C on a cell selection copies TSV; copying text in inputs or the row panel is left alone.
 document.addEventListener('copy', (e) => {
   const tab = activeTab();
   if (!tab?.sel || tab.el.grid.hidden || /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName) || !getSelection().isCollapsed) return;
@@ -388,9 +384,58 @@ $('#dl').onload = () => {
   if (exportTab && err?.error) setStatus(exportTab, 'Export failed: ' + errText({ ...err, message: err.error }), true);
 };
 
-function showCell(tab, col, v, wasCut) {
-  tab.el.cell.hidden = false;
-  tab.el.cell.textContent = `${col.name} (${col.type})${wasCut ? ' — first 10 KB only' : ''}\n\n` + (v === null ? 'NULL' : v === '' ? "'' (empty string)" : v);
+// showRow opens row r of res in the side panel, every field copyable. On an
+// editable table, typed or pasted values are staged into tab.changes by Save.
+function showRow(tab, res, r, i, force) {
+  const e = tab.el, side = e.side;
+  if (!force && !side.hidden && side.res === res && side.r === r) return focusField(side, i); // keep unsaved typing
+  const own = res === tab.res, isNew = r >= res.rows.length, ch = own ? rowChange(tab, r) : null;
+  const cut = new Set((res.cut || []).filter(([cr]) => cr === r).map(([, c]) => c));
+  const canEdit = own && editable(tab) && ch?.op !== 'delete', draft = {};
+  const save = () => {
+    const c = ch || tab.changes[tab.changes.push({ op: 'update', r, set: {} }) - 1];
+    for (const [k, v] of Object.entries(draft)) {
+      const name = res.columns[k].name;
+      if (v === undefined || (c.op === 'update' && v === res.rows[r][k])) delete c.set[name]; else c.set[name] = v;
+    }
+    if (c.op === 'update' && !Object.keys(c.set).length) tab.changes.splice(tab.changes.indexOf(c), 1);
+    renderGrid(tab, res, true);
+    showRow(tab, res, r, i, true);
+  };
+  side.fields = res.columns.map((col, k) => {
+    const ro = !canEdit || cut.has(k);
+    const ta = h('textarea', { rows: 1, readonly: ro, spellcheck: 'false', 'aria-label': col.name, oninput: () => { draft[k] = ta.value; ta.placeholder = ''; } });
+    const show = (v) => { draft[k] = v; ta.value = v ?? ''; ta.placeholder = v === undefined ? 'DEFAULT' : v === null ? 'NULL' : ''; };
+    show(ch?.set && col.name in ch.set ? ch.set[col.name] : isNew ? undefined : res.rows[r][k]);
+    return h('div', { class: 'field' }, h('div', { class: 'row' },
+      h('b', { class: 'grow' }, col.name + (col.pk ? ' 🔑' : '')), h('small', {}, col.type + (cut.has(k) ? ' · first 10 KB' : '')),
+      h('button', { title: 'Copy value', onclick: () => navigator.clipboard.writeText(ta.value) }, 'Copy'),
+      ro ? null : h('button', { onclick: () => show(null) }, 'NULL'),
+      ro || !isNew ? null : h('button', { onclick: () => show(undefined) }, 'Default')), ta);
+  });
+  side.onkeydown = (ev) => {
+    if (canEdit && ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) save(); else if (ev.key === 'Escape') side.hidden = true;
+  };
+  side.replaceChildren(h('div', { class: 'row' }, h('b', { class: 'grow' }, isNew ? 'New row' : 'Row'),
+    canEdit ? h('button', { class: 'primary', title: 'Stage these values (⌘/Ctrl+Enter); Apply writes them', onclick: save }, 'Save') : null,
+    h('button', { 'aria-label': 'Close row panel', onclick: () => { side.hidden = true; } }, '×')),
+  ch?.op === 'delete' ? h('p', { class: 'status' }, 'This row will be deleted. Press Delete rows again to restore it.') : '', ...side.fields);
+  Object.assign(side, { res, r, hidden: false });
+  focusField(side, i);
+}
+
+// grip sits on the panel's left edge; dragging it sets the width for every tab.
+const grip = () => h('div', { class: 'grip', onpointerdown: (ev) => {
+  ev.preventDefault();
+  const x0 = ev.clientX, w0 = ev.target.nextElementSibling.offsetWidth;
+  const move = (m) => document.body.style.setProperty('--side', Math.max(240, Math.min(innerWidth * 0.7, w0 + x0 - m.clientX)) + 'px');
+  addEventListener('pointermove', move);
+  addEventListener('pointerup', () => removeEventListener('pointermove', move), { once: true });
+} });
+
+function focusField(side, i) {
+  side.fields.forEach((f, k) => f.classList.toggle('on', k === i));
+  side.fields[i].scrollIntoView({ block: 'nearest' });
 }
 
 const ops = ['contains', '=', '!=', '<', '<=', '>', '>=', 'is null', 'is not null'];
@@ -423,14 +468,14 @@ const editable = (tab) => tab.kind === 'table' && !!S.conns.find((c) => c.id ===
 const keepEdits = (tab) => tab.changes.length > 0 && !confirm(`Discard ${tab.changes.length} unapplied change(s) to ${tab.table}?`);
 // rowChange is the pending change for grid row r; rows past the page are new rows.
 const rowChange = (tab, r) => r < tab.res.rows.length ? tab.changes.find((c) => c.r === r) : tab.changes.filter((c) => c.op === 'insert')[r - tab.res.rows.length];
-const redraw = (tab, changes = tab.changes) => { tab.changes = changes; tab.el.edit.hidden = true; renderGrid(tab, tab.res, true); };
+const redraw = (tab, changes = tab.changes) => { tab.changes = changes; tab.el.side.hidden = true; renderGrid(tab, tab.res, true); };
 addEventListener('beforeunload', (e) => { if (S.tabs.some((t) => t.changes.length)) e.preventDefault(); });
 
 function renderEdits(tab) {
   const e = tab.el, n = tab.changes.length, ok = editable(tab);
   e.editBar.hidden = !S.conns.find((c) => c.id === tab.conn)?.editable;
   e.addRow.hidden = e.delRows.hidden = !ok;
-  e.editNote.textContent = ok ? 'Click a cell to edit it. Nothing is written until you apply.' : `Read-only: ${tab.table} has no primary key, so its rows can't be matched safely.`;
+  e.editNote.textContent = ok ? 'Click a row to edit it in the side panel. Nothing is written until you apply.' : `Read-only: ${tab.table} has no primary key, so its rows can't be matched safely.`;
   e.review.hidden = !n;
   e.review.replaceChildren(
     h('div', { class: 'row' }, h('b', {}, `${n} pending change${n === 1 ? '' : 's'}`), h('span', { class: 'grow' }),
@@ -449,39 +494,11 @@ function describeChange(tab, c) {
   return c.op === 'insert' ? `Insert row: ${sets || 'all defaults'}` : c.op === 'delete' ? `Delete row ${where}` : `Update row ${where}: ${sets}`;
 }
 
-// editCell opens the editor for one cell; Set stages the value in tab.changes.
-function editCell(tab, r, i) {
-  const e = tab.el, col = tab.res.columns[i], ch = rowChange(tab, r), isNew = r >= tab.res.rows.length;
-  const orig = isNew ? undefined : tab.res.rows[r][i];
-  const cur = ch?.set && col.name in ch.set ? ch.set[col.name] : orig;
-  const cut = !isNew && (tab.res.cut || []).some(([cr, cc]) => cr === r && cc === i);
-  const label = h('div', { class: 'row' }, h('b', {}, col.name), h('small', {}, col.type + (col.pk ? ' · primary key' : '')));
-  e.edit.hidden = false;
-  if (cut || ch?.op === 'delete') {
-    e.edit.replaceChildren(label, h('p', { class: 'status' }, cut ? "Only the first 10 KB is loaded, so this value can't be edited here." : 'This row will be deleted. Press Delete rows again to restore it.'));
-    return;
-  }
-  const ta = h('textarea', { class: 'sql', rows: 3, 'aria-label': 'Value', placeholder: cur === undefined ? 'DEFAULT' : cur === null ? 'NULL' : '' });
-  ta.value = cur ?? '';
-  const stage = (v) => {
-    const c = rowChange(tab, r) || tab.changes[tab.changes.push({ op: 'update', r, set: {} }) - 1];
-    if (v === undefined || (c.op === 'update' && v === orig)) delete c.set[col.name]; else c.set[col.name] = v;
-    if (c.op === 'update' && !Object.keys(c.set).length) tab.changes.splice(tab.changes.indexOf(c), 1);
-    renderGrid(tab, tab.res, true);
-    editCell(tab, r, i);
-  };
-  ta.onkeydown = (ev) => { if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) stage(ta.value); };
-  e.edit.replaceChildren(label, ta, h('div', { class: 'row' },
-    h('button', { class: 'primary', title: '⌘/Ctrl+Enter', onclick: () => stage(ta.value) }, 'Set'),
-    h('button', { onclick: () => stage(null) }, 'Set NULL'),
-    isNew ? h('button', { onclick: () => stage(undefined) }, 'Use default') : null));
-}
-
 function addRow(tab) {
   tab.changes.push({ op: 'insert', set: {} });
   renderGrid(tab, tab.res, true);
   const r = tab.el.grid.querySelectorAll('tbody tr').length - 1;
-  select(tab, r, 0); editCell(tab, r, 0);
+  select(tab, r, 0); showRow(tab, tab.res, r, 0);
   tab.el.grid.scrollTo(0, tab.el.grid.scrollHeight);
 }
 
@@ -540,14 +557,14 @@ function buildSqlPane(tab) {
   e.cancel = h('button', { disabled: true, onclick: () => tab.inflight?.abort() }, 'Cancel');
   e.status = h('div', { class: 'status', role: 'status' }, 'Read-only: every statement runs inside a READ ONLY transaction.');
   e.grid = h('div', { class: 'grid' });
-  e.cell = h('pre', { class: 'cell', hidden: true });
+  e.side = h('div', { class: 'side', hidden: true });
   e.hist = h('div', { class: 'history', hidden: true });
   e.pane = h('section', { class: 'pane' }, e.sql,
     h('div', { class: 'row' }, e.run, e.cancel,
       h('button', { title: 'Download every row of the query', onclick: () => sqlText(tab).sql.trim() && exportCSV(tab, { sql: sqlText(tab).sql }) }, 'Export CSV'),
       h('span', { class: 'grow' }),
       h('button', { onclick: () => { e.hist.hidden = !e.hist.hidden; renderHistory(tab); } }, 'History')),
-    e.hist, e.status, e.grid, e.cell);
+    e.hist, e.status, h('div', { class: 'body' }, e.grid, grip(), e.side));
 }
 
 // sqlText is the selection if there is one, else the whole editor.
@@ -586,7 +603,7 @@ async function runSQL(tab) {
   } catch (e) {
     if (e.name === 'AbortError') setStatus(tab, 'Cancelled.');
     else {
-      tab.res = tab.sel = null; tab.el.grid.replaceChildren(); // don't leave the previous result under the error
+      tab.res = tab.sel = null; tab.el.grid.replaceChildren(); tab.el.side.hidden = true; // don't leave the previous result under the error
       setStatus(tab, errText(e) + (e.position ? `\nAt character ${e.position}.` : ''), true);
       if (e.position && S.active === tab.id) { const p = offset + e.position - 1; ta.focus(); ta.setSelectionRange(p, p + 1); }
     }
