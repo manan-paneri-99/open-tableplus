@@ -2,7 +2,7 @@
 
 **Date:** 24 October 2026 · **Architecture sections (§3–§7) kept current through v0.3**
 **Supersedes for v1:** `product-spec.md` §6–§8 (the long-term vision there still stands)
-**See also:** `v0.3-plan.md` (current release), `STATUS.md` (where things stand)
+**See also:** `v0.3-plan.md`, `v0.4-plan.md` (current release), `STATUS.md` (where things stand)
 
 ## 1. v1 in one sentence
 
@@ -34,7 +34,7 @@ browser ──HTTP/JSON──▶ open-tableplus (127.0.0.1:7777, single binary, 
 - **Go stdlib** `net/http` (1.22+ pattern routing) and `embed`. **One dependency:** `github.com/jackc/pgx/v5`.
 - **User SQL runs through `pgconn.ExecParams`** (the extended protocol). Postgres then refuses multi-statement strings, so `SELECT 1; COMMIT; DELETE …` can't sneak past the read-only transaction.
 - **Frontend:** `index.html` + `app.js` + `app.css`, vanilla JS, no build. The grid is a plain `<table>` (≤ 500 rows).
-- **State:** `~/.config/open-tableplus/` holds `connections.json`, `history.json` (from v0.3) and `token`, all `0600` and written atomically. Open tabs live in browser localStorage. Nothing else, so restarting is free.
+- **State:** `~/.config/open-tableplus/` holds `connections.json` (`editable` from v0.4), `history.json` (from v0.3) and `token`, all `0600` and written atomically. Open tabs live in browser localStorage. Nothing else, so restarting is free.
 - **Infra:** none. `go build && ./open-tableplus`. Dev/test Postgres is a throwaway `initdb` cluster on port 55432 (`scripts/devdb.sh`). It never touches your own databases.
 
 Budget: **< 1,500 lines** of app code for v1. From v0.3 through v0.5 the cap is **< 2,000 lines** of app code (tests excluded), with an audit before each release.
@@ -82,6 +82,7 @@ POST   /api/c/{id}/{db}/sql           {sql} → {columns, rows, cut, more, tag, 
 GET    /api/c/{id}/{db}/history       v0.3: newest first, max 100
 GET    /api/c/{id}/{db}/structure     v0.3: ?schema=&table= → {columns, indexes, foreignKeys, referencedBy}
 POST   /api/c/{id}/{db}/export        v0.3: form field req = rows request or {sql} → streamed CSV attachment
+POST   /api/c/{id}/{db}/edit          v0.4: {schema, table, changes} → {applied}; one READ WRITE transaction; needs editable
 ```
 
 Errors are JSON `{error, code?, detail?, hint?, position?}`. Postgres errors return 422, bad input 400, an unreachable DB 502, a timeout 504.

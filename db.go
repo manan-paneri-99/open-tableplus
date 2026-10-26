@@ -126,15 +126,20 @@ type Result struct {
 
 // readOnly runs fn on one connection inside BEGIN READ ONLY ... ROLLBACK.
 // Postgres, not our code, is what refuses writes.
+func readOnly(ctx context.Context, pool *pgxpool.Pool, fn func(pc *pgconn.PgConn) error) error {
+	return inTx(ctx, pool, pgx.ReadOnly, fn)
+}
+
+// inTx runs fn in a transaction: ReadOnly always rolls back, ReadWrite
+// (only Edit uses it) commits if fn succeeds.
 //
 // If the pooled connection turns out to be dead before fn runs (e.g. the
-// server restarted), it retries once on a fresh one. Safe: nothing ran yet,
-// and everything here is read-only anyway.
-func readOnly(ctx context.Context, pool *pgxpool.Pool, fn func(pc *pgconn.PgConn) error) error {
-	conn, tx, err := begin(ctx, pool)
+// server restarted), it retries once on a fresh one. Safe: nothing ran yet.
+func inTx(ctx context.Context, pool *pgxpool.Pool, mode pgx.TxAccessMode, fn func(pc *pgconn.PgConn) error) error {
+	conn, tx, err := begin(ctx, pool, mode)
 	var dial *pgconn.ConnectError
 	if err != nil && ctx.Err() == nil && !errors.As(err, &dial) {
-		conn, tx, err = begin(ctx, pool)
+		conn, tx, err = begin(ctx, pool, mode)
 	}
 	if err != nil {
 		return err
@@ -143,17 +148,20 @@ func readOnly(ctx context.Context, pool *pgxpool.Pool, fn func(pc *pgconn.PgConn
 	defer func() {
 		rctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		tx.Rollback(rctx)
+		tx.Rollback(rctx) // no-op after a commit
 	}()
-	return fn(tx.Conn().PgConn())
+	if err := fn(tx.Conn().PgConn()); err != nil || mode == pgx.ReadOnly {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
-func begin(ctx context.Context, pool *pgxpool.Pool) (*pgxpool.Conn, pgx.Tx, error) {
+func begin(ctx context.Context, pool *pgxpool.Pool, mode pgx.TxAccessMode) (*pgxpool.Conn, pgx.Tx, error) {
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	tx, err := conn.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{AccessMode: mode})
 	if err != nil {
 		conn.Release()
 		return nil, nil, err
@@ -557,6 +565,92 @@ func Structure(ctx context.Context, pool *pgxpool.Pool, schema, table string) (m
 		return nil
 	})
 	return out, err
+}
+
+// Change is one row edit from the grid. Key holds the row's primary key
+// plus the original text of the columns it checks, so a row someone changed
+// since it was loaded matches nothing.
+type Change struct {
+	Op  string             `json:"op"` // insert, update or delete
+	Key map[string]*string `json:"key"`
+	Set map[string]*string `json:"set"`
+}
+
+type EditReq struct {
+	Schema  string   `json:"schema"`
+	Table   string   `json:"table"`
+	Changes []Change `json:"changes"`
+}
+
+// Edit applies every change in one READ WRITE transaction, all or nothing.
+// It's the only code that writes, and it runs only statements it builds:
+// quoted identifiers, and every value a parameter. Parameters are untyped, so
+// Postgres takes each one's type from its column and rejects unknown columns.
+func Edit(ctx context.Context, pool *pgxpool.Pool, req EditReq) error {
+	return inTx(ctx, pool, pgx.ReadWrite, func(pc *pgconn.PgConn) error {
+		_, _, cols, _, err := tableQuery(ctx, pc, RowsReq{Schema: req.Schema, Table: req.Table})
+		if err != nil {
+			return err
+		}
+		pk := map[string]bool{}
+		for _, c := range cols {
+			if c.PK {
+				pk[c.Name] = true
+			}
+		}
+		if len(pk) == 0 {
+			return userErr("only tables with a primary key can be edited")
+		}
+		table := pgx.Identifier{req.Schema, req.Table}.Sanitize()
+		for i, ch := range req.Changes {
+			var params [][]byte
+			arg := func(v *string) string {
+				var b []byte // nil is NULL
+				if v != nil {
+					b = append([]byte{}, *v...)
+				}
+				params = append(params, b)
+				return "$" + strconv.Itoa(len(params))
+			}
+			var names, vals, set, where []string
+			for name, v := range ch.Set {
+				names, vals = append(names, ident(name)), append(vals, arg(v))
+				set = append(set, ident(name)+" = "+vals[len(vals)-1])
+			}
+			keys := 0
+			for name, v := range ch.Key {
+				if pk[name] { // compared as its own type, so the primary key index is used
+					keys++
+					where = append(where, ident(name)+" = "+arg(v))
+				} else { // compared as text, which works for every type, json included
+					where = append(where, ident(name)+"::text IS NOT DISTINCT FROM "+arg(v))
+				}
+			}
+			var sql string
+			switch {
+			case ch.Op == "insert" && len(ch.Key) > 0, ch.Op != "insert" && keys < len(pk):
+				return userErr(fmt.Sprintf("change %d: an update or delete needs the whole primary key, and an insert none", i+1))
+			case ch.Op == "insert" && len(names) == 0:
+				sql = "INSERT INTO " + table + " DEFAULT VALUES"
+			case ch.Op == "insert":
+				sql = "INSERT INTO " + table + " (" + strings.Join(names, ", ") + ") VALUES (" + strings.Join(vals, ", ") + ")"
+			case ch.Op == "update" && len(set) > 0:
+				sql = "UPDATE " + table + " SET " + strings.Join(set, ", ") + " WHERE " + strings.Join(where, " AND ")
+			case ch.Op == "delete":
+				sql = "DELETE FROM " + table + " WHERE " + strings.Join(where, " AND ")
+			default:
+				return userErr(fmt.Sprintf("change %d: bad change", i+1))
+			}
+			tag, err := pc.ExecParams(ctx, sql, params, nil, nil, nil).Close()
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() != 1 {
+				return userErr(fmt.Sprintf("change %d: the row was changed or deleted since it was loaded; nothing was applied", i+1))
+			}
+		}
+		return nil
+	})
 }
 
 func ident(s string) string { return pgx.Identifier{s}.Sanitize() }

@@ -5,15 +5,14 @@
 ## Where things stand
 
 - **Repo:** https://github.com/manan-paneri-99/open-tableplus (public). The local folder is still named `apna-tableplus`; the product name is open-tableplus everywhere else.
-- **`main`** = **v0.2.1**, released and marked Latest.
+- **`main`** = **v0.3.0**, released and marked Latest.
 - **Releases:**
+  - v0.3.0: copy as TSV, streamed CSV export, server-side query history, environment labels, structure view.
   - v0.2.1: pooled sessions are reset with `DISCARD ALL`; README roadmap.
   - v0.2.0: tabs, and search/filters run on Enter.
   - v0.1.0: marked pre-release; it crashes on filters that match no rows.
-- **Open: PR #3**, branch `v0.3-data-out`, CI green. It contains all of v0.3: copy, CSV export, server-side query history, environment labels and the structure view.
-  - **Don't merge it until the user says so.** They asked to hold it.
-  - Once they approve: merge, run the pre-release audit (line budget), then tag `v0.3.0` on `main`.
-- **Size:** app code (`*.go` excluding tests, plus `web/`) is 1,854 lines, against a budget of 2,000 through v0.5. Tests are about 690 lines.
+- **Open: PR #4**, branch `status-v0.3.0`: v0.3.0 docs plus all of v0.4 (safe editing; spec in `docs/v0.4-plan.md`, user guide in the README "Editing" section). CI green. Not merged or tagged; wait for the user.
+- **Size:** app code (`*.go` excluding tests, plus `web/`) is **2,133 lines**. The budget was 2,000; on 25 October 2026 the user accepted 2,107 for v0.4 (v0.3.0 was 1,854; editing added ~250). The row side panel (26 October) added 26 more, not yet signed off; dropping its per-field Copy buttons is the obvious trim. There's no new number for v0.5 yet, so ask before growing further. Tests are about 785 lines.
 
 ## How to work on it
 
@@ -37,13 +36,14 @@ See `CLAUDE.md` for commands and conventions. The release flow:
 | SQLite was considered for storage and rejected for now | A large dependency for a 100-entry list. Revisit when SQLite is added as a browsable engine, since the driver comes along then |
 | URL-hash routing removed (v0.2 audit) | Saved tabs already cover restoring after a reload |
 | Postgres-specific code stays in `db.go`; no engine interface yet | Build the interface when a second engine is actually added |
+| Edits use untyped parameters, and match rows on the primary key plus the original text of the checked columns | Postgres infers each value's type from its column and rejects unknown columns, so no type code. Comparing as text works for every type (json has no `=`), and exactly one row must change, or the whole apply rolls back |
 | Roadmap order: v0.3 get data out, v0.4 safe editing, v0.5 SSH/TLS | The user chose editing before SSH |
 | Binaries are unsigned for now | Signing needs paid Apple/Windows certificates; the README documents the first-launch workaround |
 
 ## Gaps vs the original `product-spec.md`
 
 - **Phase 1 (read-only explorer):** complete once v0.3 merges, except **syntax highlighting**.
-- **Phase 2 (safe editing):** not started; it's v0.4.
+- **Phase 2 (safe editing):** built in PR #4 (v0.4), including a row side panel for copying and editing a row; not released yet.
 - **Phase 3 (polish):** missing **saved queries** and a **diagnostics view**.
 - **Phase 4:** SSH/TLS is v0.5; other engines are "Later"; import, backup and ER diagrams are not planned.
 - **Non-functional requirements:**
@@ -70,13 +70,6 @@ See `CLAUDE.md` for commands and conventions. The release flow:
 
 ## Next steps
 
-1. **v0.3:** wait for the user's review of PR #3, then merge, audit and tag `v0.3.0`.
-2. **v0.4, safe editing:** write `docs/v0.4-plan.md` first, in the same format as `v0.3-plan.md`. Scope comes from the README roadmap and `product-spec.md` Phase 2:
-   - opt-in per connection;
-   - edit, insert and delete only on tables with a primary key;
-   - review pending changes before applying;
-   - one transaction, with conflict detection (include original values in the `WHERE`);
-   - an extra confirmation when the connection's `env` is `prod`.
-
-   This is the first feature that writes, so the read-only guarantees need a deliberate, tested exception that only the edit endpoint can use.
-3. **Later:** v0.5 SSH/TLS; then syntax highlighting, saved queries, grid keyboard navigation, Firefox/Safari checks, signed binaries and Homebrew, and MySQL/SQLite.
+1. **v0.4, safe editing:** built in PR #4 (`docs/v0.4-plan.md`). Get the user's review (2,107 lines accepted; now 2,133 with the row panel), then merge and tag `v0.4.0`. Only `Edit` in `db.go` opens a `READ WRITE` transaction, and only when the connection has `editable` set.
+2. **v0.5:** SSH/TLS, plus **passwords in the OS keychain** (user feedback, 26 October 2026). Likely `zalando/go-keyring` (works with `CGO_ENABLED=0` on all five targets; first dependency besides pgx). The change stays in `store.go`: `Put` writes to the keychain and leaves the password out of the JSON, `Get` reads it, `Delete` removes it, and plaintext passwords are migrated on load. Tests use `keyring.MockInit()`. Decide before building: when Linux has no Secret Service (headless, SSH, WSL), fall back to the 0600 file with a warning, or refuse and point to `~/.pgpass`. Check that the password doesn't appear in `ps` while `security` runs on macOS, and how Keychain prompts behave with unsigned rebuilds. Estimate ~40 lines.
+3. **Later:** then syntax highlighting, saved queries, grid keyboard navigation, Firefox/Safari checks, signed binaries and Homebrew, and MySQL/SQLite.

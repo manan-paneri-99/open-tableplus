@@ -23,7 +23,8 @@ type Conn struct {
 	Password string `json:"password,omitempty"`
 	Database string `json:"database"`
 	SSLMode  string `json:"sslmode"`
-	Env      string `json:"env"` // "", dev, staging or prod: shown as a colour in the UI
+	Env      string `json:"env"`      // "", dev, staging or prod: shown as a colour in the UI
+	Editable bool   `json:"editable"` // opt-in: the grid may write (v0.4); everything else stays read-only
 }
 
 // ConnView is what the API returns: never the password.

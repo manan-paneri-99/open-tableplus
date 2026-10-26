@@ -123,7 +123,7 @@ function openTab(spec, { focus = true } = {}) {
     id: S.nextId++, kind: spec.kind, conn: spec.conn, db: spec.db, schema: spec.schema, table: spec.table,
     t: { q: '', filters: [], sort: '', desc: false, page: 0, ...spec.t, columns: [] },
     sql: spec.sql ?? '', n: spec.kind === 'sql' ? (spec.n || ++S.sqlCount) : 0,
-    loaded: false, inflight: null, el: {},
+    loaded: false, inflight: null, el: {}, changes: [],
   };
   S.sqlCount = Math.max(S.sqlCount, tab.n);
   (tab.kind === 'table' ? buildTablePane : buildSqlPane)(tab);
@@ -170,11 +170,11 @@ function renderTabs() {
   $('#tabs').replaceChildren(...S.tabs.map((t) => h('div', {
     class: 'tab' + (t.id === S.active ? ' on' : '') + ((env) => env ? ` env env-${env}` : '')(S.conns.find((c) => c.id === t.conn)?.env), role: 'tab', 'aria-selected': String(t.id === S.active), title: `${connName(t.conn)} / ${t.db} / ` + (t.kind === 'sql' ? 'SQL' : `${t.schema}.${t.table}`),
     onclick: () => activate(t),
-    onauxclick: (e) => { if (e.button === 1) { e.preventDefault(); closeTab(t); } },
+    onauxclick: (e) => { if (e.button === 1) { e.preventDefault(); if (!keepEdits(t)) closeTab(t); } },
   },
     h('span', { class: 'n' }, tabLabel(t)),
     many ? h('small', {}, t.db) : null,
-    h('button', { class: 'x', 'aria-label': `Close ${tabLabel(t)}`, onclick: (e) => { e.stopPropagation(); closeTab(t); } }, '×'),
+    h('button', { class: 'x', 'aria-label': `Close ${tabLabel(t)}`, onclick: (e) => { e.stopPropagation(); if (!keepEdits(t)) closeTab(t); } }, '×'),
   )));
   $('#tabs').querySelector('.on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 }
@@ -213,13 +213,13 @@ function buildTablePane(tab) {
     oninput: (ev) => { tab.t.q = ev.target.value; pending(); saveTabs(); }, onkeydown: onEnter,
   });
   e.search = h('button', { title: 'Run search (Enter)', onclick: () => apply(tab) }, 'Search');
-  e.prev = h('button', { 'aria-label': 'Previous page', onclick: () => { tab.t.page--; loadRows(tab); } }, '‹');
-  e.next = h('button', { 'aria-label': 'Next page', onclick: () => { tab.t.page++; loadRows(tab); } }, '›');
+  e.prev = h('button', { 'aria-label': 'Previous page', onclick: () => { if (!keepEdits(tab)) { tab.t.page--; loadRows(tab); } } }, '‹');
+  e.next = h('button', { 'aria-label': 'Next page', onclick: () => { if (!keepEdits(tab)) { tab.t.page++; loadRows(tab); } } }, '›');
   e.pageInfo = h('span');
   e.filters = h('div', { class: 'filters' });
   e.status = h('div', { class: 'status', role: 'status' });
   e.grid = h('div', { class: 'grid' });
-  e.cell = h('pre', { class: 'cell', hidden: true });
+  e.side = h('div', { class: 'side', hidden: true });
   e.dataBtn = h('button', { class: 'on', onclick: () => showStructure(tab, false) }, 'Data');
   e.structBtn = h('button', { onclick: () => showStructure(tab, true) }, 'Structure');
   e.tools = h('span', { class: 'row grow' }, e.q,
@@ -227,16 +227,22 @@ function buildTablePane(tab) {
     h('button', { title: 'Download every matching row (current search, filters and sort)', onclick: () => exportCSV(tab, tableReq(tab)) }, 'Export CSV'),
     h('span', { class: 'grow' }), e.prev, e.pageInfo, e.next);
   e.structure = h('div', { class: 'structure', hidden: true });
+  e.addRow = h('button', { onclick: () => addRow(tab) }, '+ Row');
+  e.delRows = h('button', { title: 'Mark the selected rows for deletion, or restore them', onclick: () => deleteRows(tab) }, 'Delete rows');
+  e.editNote = h('small', { class: 'status' });
+  e.editBar = h('div', { class: 'row', hidden: true }, e.addRow, e.delRows, e.editNote);
+  e.review = h('div', { class: 'review', hidden: true });
   e.pane = h('section', { class: 'pane' },
     h('div', { class: 'row' }, h('span', { class: 'seg' }, e.dataBtn, e.structBtn), e.tools),
-    e.filters, e.status, e.grid, e.structure, e.cell);
+    e.filters, e.editBar, e.review, e.status, h('div', { class: 'body' }, e.grid, e.structure, grip(), e.side));
 }
 
 async function showStructure(tab, on) {
   const e = tab.el;
   e.dataBtn.classList.toggle('on', !on); e.structBtn.classList.toggle('on', on);
-  e.tools.hidden = e.filters.hidden = e.grid.hidden = on;
-  e.structure.hidden = !on; e.cell.hidden = true;
+  e.tools.hidden = e.filters.hidden = e.grid.hidden = e.editBar.hidden = e.review.hidden = on;
+  e.structure.hidden = !on; e.side.hidden = true;
+  if (!on && tab.res) renderEdits(tab);
   if (!on || e.structure.childElementCount) return;
   setStatus(tab, 'Loading…');
   try {
@@ -261,12 +267,13 @@ function setStatus(tab, msg, err) {
   tab.el.status.textContent = msg;
 }
 
-function apply(tab) { tab.t.page = 0; loadRows(tab); }
+function apply(tab) { if (!keepEdits(tab)) { tab.t.page = 0; loadRows(tab); } }
 
 async function loadRows(tab) {
   const t = tab.t;
   tab.inflight?.abort();
   const ctl = tab.inflight = new AbortController();
+  tab.changes = []; // callers asked first (keepEdits)
   tab.el.search.classList.remove('dirty'); // whatever is in the boxes is what's being loaded
   setStatus(tab, 'Loading…');
   saveTabs();
@@ -292,12 +299,16 @@ async function loadRows(tab) {
 
 const numeric = /^(smallint|integer|bigint|numeric|real|double precision|money|oid)\b/;
 
-// renderGrid shows a result in the tab's main grid, where cells can be selected and copied.
+// renderGrid shows a result in the tab's main grid, where cells can be selected
+// and copied (and edited). Redrawing the same result keeps scroll and selection.
 function renderGrid(tab, res, sortable) {
-  tab.res = res; tab.sel = null;
-  tab.el.grid.replaceChildren(gridTable(tab, res, sortable, true));
-  tab.el.grid.scrollTo(0, 0);
-  tab.el.cell.hidden = true;
+  const g = tab.el.grid, fresh = res !== tab.res, x = g.scrollLeft, y = g.scrollTop;
+  tab.res = res;
+  g.replaceChildren(gridTable(tab, res, sortable, true));
+  if (fresh) { tab.sel = null; tab.el.side.hidden = true; }
+  g.scrollTo(fresh ? 0 : x, fresh ? 0 : y);
+  if (tab.sel) paintSel(tab);
+  if (sortable) renderEdits(tab);
 }
 
 function gridTable(tab, res, sortable, selectable) {
@@ -308,15 +319,26 @@ function gridTable(tab, res, sortable, selectable) {
     class: sortable ? 'sortable' : null,
     title: sortable ? 'Sort' : null,
     onclick: sortable ? () => {
+      if (keepEdits(tab)) return;
       if (t.sort === c.name) t.desc = !t.desc; else { t.sort = c.name; t.desc = false; }
       t.page = 0; loadRows(tab);
     } : null,
   }, c.name + (c.pk ? ' 🔑' : '') + (sortable && t.sort === c.name ? (t.desc ? ' ↓' : ' ↑') : ''), h('small', {}, c.type))));
-  const body = res.rows.map((row, r) => h('tr', {}, row.map((v, i) => h('td', {
-    class: [v === null && 'null', num[i] && 'num', cut.has(r + ',' + i) && 'cut'].filter(Boolean).join(' ') || null,
-    onmousedown: (e) => { if (e.shiftKey) e.preventDefault(); }, // shift-click extends the cell selection, not a text selection
-    onclick: (e) => { if (selectable) select(tab, r, i, e.shiftKey); showCell(tab, res.columns[i], v, cut.has(r + ',' + i)); },
-  }, v === null ? 'NULL' : v.length > 300 ? v.slice(0, 300) : v))));
+  // Pending edits show in the main grid: new rows at the bottom (undefined = DEFAULT), changed cells highlighted.
+  const edits = selectable ? tab.changes : [];
+  const rows = [...res.rows, ...edits.filter((c) => c.op === 'insert').map(() => res.columns.map(() => undefined))];
+  const body = rows.map((row, r) => {
+    const ch = edits.length ? rowChange(tab, r) : null;
+    return h('tr', { class: ch ? 'ch-' + ch.op : null }, row.map((v, i) => {
+      const dirty = ch?.set && res.columns[i].name in ch.set;
+      if (dirty) v = ch.set[res.columns[i].name];
+      return h('td', {
+        class: [v == null && 'null', num[i] && 'num', cut.has(r + ',' + i) && 'cut', dirty && 'dirty'].filter(Boolean).join(' ') || null,
+        onmousedown: (e) => { if (e.shiftKey) e.preventDefault(); }, // shift-click extends the cell selection, not a text selection
+        onclick: (e) => { if (selectable) select(tab, r, i, e.shiftKey); showRow(tab, res, r, i); },
+      }, v === undefined ? 'DEFAULT' : v === null ? 'NULL' : v.length > 300 ? v.slice(0, 300) : v);
+    }));
+  });
   return h('table', {}, h('thead', {}, head), h('tbody', {}, body));
 }
 
@@ -325,12 +347,16 @@ const bounds = (s) => [Math.min(s.r0, s.r1), Math.max(s.r0, s.r1), Math.min(s.c0
 
 function select(tab, r, c, extend) {
   tab.sel = extend && tab.sel ? { ...tab.sel, r1: r, c1: c } : { r0: r, c0: c, r1: r, c1: c };
+  paintSel(tab);
+}
+
+function paintSel(tab) {
   const [r0, r1, c0, c1] = bounds(tab.sel);
   tab.el.grid.querySelectorAll('tbody tr').forEach((tr, ri) =>
     [...tr.children].forEach((td, ci) => td.classList.toggle('on', ri >= r0 && ri <= r1 && ci >= c0 && ci <= c1)));
 }
 
-// ⌘/Ctrl+C on a cell selection copies TSV; copying text in inputs or the cell viewer is left alone.
+// ⌘/Ctrl+C on a cell selection copies TSV; copying text in inputs or the row panel is left alone.
 document.addEventListener('copy', (e) => {
   const tab = activeTab();
   if (!tab?.sel || tab.el.grid.hidden || /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName) || !getSelection().isCollapsed) return;
@@ -358,9 +384,58 @@ $('#dl').onload = () => {
   if (exportTab && err?.error) setStatus(exportTab, 'Export failed: ' + errText({ ...err, message: err.error }), true);
 };
 
-function showCell(tab, col, v, wasCut) {
-  tab.el.cell.hidden = false;
-  tab.el.cell.textContent = `${col.name} (${col.type})${wasCut ? ' — first 10 KB only' : ''}\n\n` + (v === null ? 'NULL' : v === '' ? "'' (empty string)" : v);
+// showRow opens row r of res in the side panel, every field copyable. On an
+// editable table, typed or pasted values are staged into tab.changes by Save.
+function showRow(tab, res, r, i, force) {
+  const e = tab.el, side = e.side;
+  if (!force && !side.hidden && side.res === res && side.r === r) return focusField(side, i); // keep unsaved typing
+  const own = res === tab.res, isNew = r >= res.rows.length, ch = own ? rowChange(tab, r) : null;
+  const cut = new Set((res.cut || []).filter(([cr]) => cr === r).map(([, c]) => c));
+  const canEdit = own && editable(tab) && ch?.op !== 'delete', draft = {};
+  const save = () => {
+    const c = ch || tab.changes[tab.changes.push({ op: 'update', r, set: {} }) - 1];
+    for (const [k, v] of Object.entries(draft)) {
+      const name = res.columns[k].name;
+      if (v === undefined || (c.op === 'update' && v === res.rows[r][k])) delete c.set[name]; else c.set[name] = v;
+    }
+    if (c.op === 'update' && !Object.keys(c.set).length) tab.changes.splice(tab.changes.indexOf(c), 1);
+    renderGrid(tab, res, true);
+    showRow(tab, res, r, i, true);
+  };
+  side.fields = res.columns.map((col, k) => {
+    const ro = !canEdit || cut.has(k);
+    const ta = h('textarea', { rows: 1, readonly: ro, spellcheck: 'false', 'aria-label': col.name, oninput: () => { draft[k] = ta.value; ta.placeholder = ''; } });
+    const show = (v) => { draft[k] = v; ta.value = v ?? ''; ta.placeholder = v === undefined ? 'DEFAULT' : v === null ? 'NULL' : ''; };
+    show(ch?.set && col.name in ch.set ? ch.set[col.name] : isNew ? undefined : res.rows[r][k]);
+    return h('div', { class: 'field' }, h('div', { class: 'row' },
+      h('b', { class: 'grow' }, col.name + (col.pk ? ' 🔑' : '')), h('small', {}, col.type + (cut.has(k) ? ' · first 10 KB' : '')),
+      h('button', { title: 'Copy value', onclick: () => navigator.clipboard.writeText(ta.value) }, 'Copy'),
+      ro ? null : h('button', { onclick: () => show(null) }, 'NULL'),
+      ro || !isNew ? null : h('button', { onclick: () => show(undefined) }, 'Default')), ta);
+  });
+  side.onkeydown = (ev) => {
+    if (canEdit && ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) save(); else if (ev.key === 'Escape') side.hidden = true;
+  };
+  side.replaceChildren(h('div', { class: 'row' }, h('b', { class: 'grow' }, isNew ? 'New row' : 'Row'),
+    canEdit ? h('button', { class: 'primary', title: 'Stage these values (⌘/Ctrl+Enter); Apply writes them', onclick: save }, 'Save') : null,
+    h('button', { 'aria-label': 'Close row panel', onclick: () => { side.hidden = true; } }, '×')),
+  ch?.op === 'delete' ? h('p', { class: 'status' }, 'This row will be deleted. Press Delete rows again to restore it.') : '', ...side.fields);
+  Object.assign(side, { res, r, hidden: false });
+  focusField(side, i);
+}
+
+// grip sits on the panel's left edge; dragging it sets the width for every tab.
+const grip = () => h('div', { class: 'grip', onpointerdown: (ev) => {
+  ev.preventDefault();
+  const x0 = ev.clientX, w0 = ev.target.nextElementSibling.offsetWidth;
+  const move = (m) => document.body.style.setProperty('--side', Math.max(240, Math.min(innerWidth * 0.7, w0 + x0 - m.clientX)) + 'px');
+  addEventListener('pointermove', move);
+  addEventListener('pointerup', () => removeEventListener('pointermove', move), { once: true });
+} });
+
+function focusField(side, i) {
+  side.fields.forEach((f, k) => f.classList.toggle('on', k === i));
+  side.fields[i].scrollIntoView({ block: 'nearest' });
 }
 
 const ops = ['contains', '=', '!=', '<', '<=', '>', '>=', 'is null', 'is not null'];
@@ -385,6 +460,88 @@ function addFilter(tab) {
   tab.el.filters.lastElementChild.querySelector('input')?.focus();
 }
 
+// ---------- editing (opt-in per connection, tables with a primary key) ----------
+// Changes are staged in tab.changes ({op, r, set}; r indexes tab.res.rows) and
+// only written by Apply, in one transaction. Reloading the page of rows drops them.
+
+const editable = (tab) => tab.kind === 'table' && !!S.conns.find((c) => c.id === tab.conn)?.editable && !!tab.res?.columns.some((c) => c.pk);
+const keepEdits = (tab) => tab.changes.length > 0 && !confirm(`Discard ${tab.changes.length} unapplied change(s) to ${tab.table}?`);
+// rowChange is the pending change for grid row r; rows past the page are new rows.
+const rowChange = (tab, r) => r < tab.res.rows.length ? tab.changes.find((c) => c.r === r) : tab.changes.filter((c) => c.op === 'insert')[r - tab.res.rows.length];
+const redraw = (tab, changes = tab.changes) => { tab.changes = changes; tab.el.side.hidden = true; renderGrid(tab, tab.res, true); };
+addEventListener('beforeunload', (e) => { if (S.tabs.some((t) => t.changes.length)) e.preventDefault(); });
+
+function renderEdits(tab) {
+  const e = tab.el, n = tab.changes.length, ok = editable(tab);
+  e.editBar.hidden = !S.conns.find((c) => c.id === tab.conn)?.editable;
+  e.addRow.hidden = e.delRows.hidden = !ok;
+  e.editNote.textContent = ok ? 'Click a row to edit it in the side panel. Nothing is written until you apply.' : `Read-only: ${tab.table} has no primary key, so its rows can't be matched safely.`;
+  e.review.hidden = !n;
+  e.review.replaceChildren(
+    h('div', { class: 'row' }, h('b', {}, `${n} pending change${n === 1 ? '' : 's'}`), h('span', { class: 'grow' }),
+      h('button', { onclick: () => redraw(tab, []) }, 'Discard all'),
+      h('button', { class: 'primary', onclick: () => applyEdits(tab) }, 'Apply')),
+    ...tab.changes.map((c) => h('div', { class: 'row' },
+      h('button', { 'aria-label': 'Revert this change', onclick: () => redraw(tab, tab.changes.filter((x) => x !== c)) }, '×'),
+      h('code', {}, describeChange(tab, c)))));
+}
+
+function describeChange(tab, c) {
+  const cols = tab.res.columns, row = tab.res.rows[c.r];
+  const q = (v) => v === null ? 'NULL' : `'${v.length > 60 ? v.slice(0, 60) + '…' : v}'`;
+  const where = c.op === 'insert' ? '' : cols.filter((col) => col.pk).map((col) => `${col.name} = ${row[cols.indexOf(col)]}`).join(', ');
+  const sets = Object.entries(c.set || {}).map(([k, v]) => c.op === 'update' ? `${k}: ${q(row[cols.findIndex((x) => x.name === k)])} → ${q(v)}` : `${k} = ${q(v)}`).join(', ');
+  return c.op === 'insert' ? `Insert row: ${sets || 'all defaults'}` : c.op === 'delete' ? `Delete row ${where}` : `Update row ${where}: ${sets}`;
+}
+
+function addRow(tab) {
+  tab.changes.push({ op: 'insert', set: {} });
+  renderGrid(tab, tab.res, true);
+  const r = tab.el.grid.querySelectorAll('tbody tr').length - 1;
+  select(tab, r, 0); showRow(tab, tab.res, r, 0);
+  tab.el.grid.scrollTo(0, tab.el.grid.scrollHeight);
+}
+
+// deleteRows marks the selected rows for deletion; marked rows are restored and new rows dropped.
+function deleteRows(tab) {
+  if (!tab.sel) return setStatus(tab, 'Select a cell in each row to delete first (shift-click for a range).');
+  const [r0, r1] = bounds(tab.sel);
+  const rows = Array.from({ length: r1 - r0 + 1 }, (_, k) => [r0 + k, rowChange(tab, r0 + k)]);
+  for (const [r, c] of rows) {
+    if (c) tab.changes.splice(tab.changes.indexOf(c), 1);
+    if (c?.op !== 'delete' && r < tab.res.rows.length) tab.changes.push({ op: 'delete', r });
+  }
+  tab.sel = null; redraw(tab);
+}
+
+// changeKey is what the server matches the row on: the primary key, plus the original
+// text of each changed column (update) or of every fully loaded column (delete).
+function changeKey(tab, c) {
+  const key = {}, cut = new Set((tab.res.cut || []).filter(([r]) => r === c.r).map(([, i]) => i));
+  tab.res.columns.forEach((col, i) => {
+    if (col.pk || (c.op === 'delete' ? !cut.has(i) : col.name in c.set)) key[col.name] = tab.res.rows[c.r][i];
+  });
+  return key;
+}
+
+async function applyEdits(tab) {
+  const conn = S.conns.find((c) => c.id === tab.conn), n = tab.changes.length, what = `${n} change${n === 1 ? '' : 's'}`;
+  if (tab.applying || (conn.env === 'prod' && !confirm(`"${conn.name}" is a PRODUCTION connection.\n\nApply ${what} to ${tab.schema}.${tab.table}?`))) return;
+  tab.applying = true;
+  setStatus(tab, 'Applying…');
+  try {
+    await api('POST', `/c/${enc(tab.conn)}/${enc(tab.db)}/edit`, {
+      schema: tab.schema, table: tab.table,
+      changes: tab.changes.map((c) => ({ op: c.op, set: c.set, key: c.op === 'insert' ? null : changeKey(tab, c) })),
+    });
+    tab.changes = [];
+    await loadRows(tab);
+    setStatus(tab, `Applied ${what}.`);
+  } catch (e) {
+    setStatus(tab, errText(e), true); // the server rolled back: nothing was applied
+  } finally { tab.applying = false; }
+}
+
 // ---------- SQL tabs ----------
 
 function buildSqlPane(tab) {
@@ -400,14 +557,14 @@ function buildSqlPane(tab) {
   e.cancel = h('button', { disabled: true, onclick: () => tab.inflight?.abort() }, 'Cancel');
   e.status = h('div', { class: 'status', role: 'status' }, 'Read-only: every statement runs inside a READ ONLY transaction.');
   e.grid = h('div', { class: 'grid' });
-  e.cell = h('pre', { class: 'cell', hidden: true });
+  e.side = h('div', { class: 'side', hidden: true });
   e.hist = h('div', { class: 'history', hidden: true });
   e.pane = h('section', { class: 'pane' }, e.sql,
     h('div', { class: 'row' }, e.run, e.cancel,
       h('button', { title: 'Download every row of the query', onclick: () => sqlText(tab).sql.trim() && exportCSV(tab, { sql: sqlText(tab).sql }) }, 'Export CSV'),
       h('span', { class: 'grow' }),
       h('button', { onclick: () => { e.hist.hidden = !e.hist.hidden; renderHistory(tab); } }, 'History')),
-    e.hist, e.status, e.grid, e.cell);
+    e.hist, e.status, h('div', { class: 'body' }, e.grid, grip(), e.side));
 }
 
 // sqlText is the selection if there is one, else the whole editor.
@@ -446,7 +603,7 @@ async function runSQL(tab) {
   } catch (e) {
     if (e.name === 'AbortError') setStatus(tab, 'Cancelled.');
     else {
-      tab.res = tab.sel = null; tab.el.grid.replaceChildren(); // don't leave the previous result under the error
+      tab.res = tab.sel = null; tab.el.grid.replaceChildren(); tab.el.side.hidden = true; // don't leave the previous result under the error
       setStatus(tab, errText(e) + (e.position ? `\nAt character ${e.position}.` : ''), true);
       if (e.position && S.active === tab.id) { const p = offset + e.position - 1; ta.focus(); ta.setSelectionRange(p, p + 1); }
     }
@@ -474,6 +631,7 @@ function openDialog(conn) {
   const f = $('#connForm');
   f.reset();
   for (const k of ['name', 'host', 'port', 'user', 'database', 'sslmode', 'env']) if (conn) f.elements[k].value = conn[k] ?? '';
+  f.elements.editable.checked = !!conn?.editable;
   f.elements.password.placeholder = conn?.hasPassword ? 'saved — leave blank to keep' : 'blank = use ~/.pgpass';
   $('#dlgDelete').hidden = !conn;
   dlgMsg('');
@@ -486,7 +644,7 @@ function formConn() {
   const f = $('#connForm').elements;
   return {
     id: editing?.id || '', name: f.name.value.trim(), host: f.host.value.trim(), port: Number(f.port.value) || 5432,
-    user: f.user.value.trim(), password: f.password.value, database: f.database.value.trim() || 'postgres', sslmode: f.sslmode.value, env: f.env.value,
+    user: f.user.value.trim(), password: f.password.value, database: f.database.value.trim() || 'postgres', sslmode: f.sslmode.value, env: f.env.value, editable: f.editable.checked,
   };
 }
 
@@ -503,7 +661,8 @@ $('#dlgSave').onclick = async () => {
     S.conns = await api('GET', '/conns');
     S.conn = null; // force reload of dbs/tree with the new settings
     $('#connDlg').close();
-    renderTabs(); // names and environments may have changed
+    renderTabs(); // names, environments and editing may have changed
+    for (const t of S.tabs) if (t.kind === 'table' && t.res) renderEdits(t);
     const a = activeTab();
     selectContext(saved.id, a?.conn === saved.id ? a.db : '');
   } catch (e) { dlgMsg(errText(e), true); }
