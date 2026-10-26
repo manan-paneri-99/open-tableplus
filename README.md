@@ -104,6 +104,7 @@ Read-only and reliable first, then writes, then reach. App code (excluding tests
   - SSH tunnels through a bastion host.
   - TLS CA and client certificates.
   - Reconnect behaviour covered by tests.
+  - Passwords saved in the OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service) instead of `connections.json`.
 
 **Later:** MySQL and SQLite (the API and UI are already engine-neutral; Postgres code lives in `db.go`), signed and notarized binaries plus Homebrew/winget, SQL syntax highlighting, ER diagrams.
 
