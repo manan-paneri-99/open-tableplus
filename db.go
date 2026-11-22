@@ -33,19 +33,35 @@ const (
 // appName identifies our sessions in pg_stat_activity.
 var appName = "open-tableplus"
 
-// Pools holds one small pool per (connection, database), so a slow or dead
-// database only ever blocks its own requests.
-type Pools struct {
-	mu sync.Mutex
-	m  map[string]*pgxpool.Pool
+// Engine is one database the API can browse: a Postgres pool (pg, here) or a
+// SQLite file (lite, in sqlite.go). Everything but Edit is read-only.
+type Engine interface {
+	Databases(ctx context.Context) ([]string, error)
+	Tree(ctx context.Context) ([]Relation, error)
+	Rows(ctx context.Context, req RowsReq) (*Result, error)
+	RunSQL(ctx context.Context, sql string) (*Result, error)
+	Export(ctx context.Context, req ExportReq, begin func() io.Writer) error
+	Structure(ctx context.Context, schema, table string) (map[string]*Result, error)
+	Edit(ctx context.Context, req EditReq) error
+	Close()
 }
 
-func (p *Pools) Get(c Conn, db string) (*pgxpool.Pool, error) {
+// Pools holds one engine per (connection, database): for Postgres a small
+// pool, so a slow or dead database only ever blocks its own requests.
+type Pools struct {
+	mu sync.Mutex
+	m  map[string]Engine
+}
+
+func (p *Pools) Get(c Conn, db string) (Engine, error) {
+	if c.Engine == "sqlite" {
+		return lite{c.Path}, nil // opened per request: nothing to keep
+	}
 	key := c.ID + "/" + db
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if pool, ok := p.m[key]; ok {
-		return pool, nil
+	if e, ok := p.m[key]; ok {
+		return e, nil
 	}
 	cfg, err := poolConfig(c, db)
 	if err != nil {
@@ -55,18 +71,18 @@ func (p *Pools) Get(c Conn, db string) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, err
 	}
-	p.m[key] = pool
-	return pool, nil
+	p.m[key] = pg{pool}
+	return p.m[key], nil
 }
 
 // Drop closes every pool belonging to a connection (after edit or delete).
 func (p *Pools) Drop(connID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for key, pool := range p.m {
+	for key, e := range p.m {
 		if strings.HasPrefix(key, connID+"/") {
 			delete(p.m, key)
-			go pool.Close() // waits for in-flight queries; don't hold the lock
+			go e.Close() // waits for in-flight queries; don't hold the lock
 		}
 	}
 }
@@ -105,6 +121,11 @@ func tuneConnConfig(cc *pgx.ConnConfig) {
 		return &pgconn.CancelRequestContextWatcherHandler{Conn: pc, DeadlineDelay: 2 * time.Second}
 	}
 }
+
+// pg is a Postgres database, reached through its pool.
+type pg struct{ pool *pgxpool.Pool }
+
+func (p pg) Close() { p.pool.Close() }
 
 // Column describes a result column. Type is Postgres's own spelling (format_type).
 type Column struct {
@@ -172,33 +193,13 @@ func begin(ctx context.Context, pool *pgxpool.Pool, mode pgx.TxAccessMode) (*pgx
 // run runs one statement over the extended protocol (so multi-statement
 // strings are rejected) with text-format params and results.
 func run(ctx context.Context, pc *pgconn.PgConn, sql string, args []string, limit int, res *Result) ([]pgconn.FieldDescription, error) {
-	params := make([][]byte, len(args))
-	for i, a := range args {
-		params[i] = []byte(a)
-	}
-	rr := pc.ExecParams(ctx, sql, params, nil, nil, nil)
+	rr := pc.ExecParams(ctx, sql, textParams(args), nil, nil, nil)
 	for rr.NextRow() {
 		if len(res.Rows) == limit {
 			res.More = true
 			break
 		}
-		vals := rr.Values()
-		row := make([]*string, len(vals))
-		for i, v := range vals {
-			if v == nil {
-				continue
-			}
-			if len(v) > cellCap {
-				v = v[:cellCap]
-				for len(v) > 0 && !utf8.Valid(v) {
-					v = v[:len(v)-1]
-				}
-				res.Cut = append(res.Cut, [2]int{len(res.Rows), i})
-			}
-			s := string(v) // copies; rr reuses its buffers
-			row[i] = &s
-		}
-		res.Rows = append(res.Rows, row)
+		res.add(rr.Values())
 	}
 	if res.Rows == nil {
 		res.Rows = [][]*string{} // JSON [] not null: the UI maps over it
@@ -207,6 +208,36 @@ func run(ctx context.Context, pc *pgconn.PgConn, sql string, args []string, limi
 	tag, err := rr.Close()
 	res.Tag = tag.String()
 	return fds, err
+}
+
+// add appends a row of text values (nil is NULL), cutting cells at cellCap.
+func (res *Result) add(vals [][]byte) {
+	row := make([]*string, len(vals))
+	for i, v := range vals {
+		if v == nil {
+			continue
+		}
+		if len(v) > cellCap {
+			v = v[:cellCap]
+			for len(v) > 0 && !utf8.Valid(v) {
+				v = v[:len(v)-1]
+			}
+			res.Cut = append(res.Cut, [2]int{len(res.Rows), i})
+		}
+		s := string(v) // copies; drivers reuse their buffers
+		row[i] = &s
+	}
+	res.Rows = append(res.Rows, row)
+}
+
+// textParams sends every parameter as text, untyped: Postgres takes the type
+// from where it's used.
+func textParams(args []string) [][]byte {
+	params := make([][]byte, len(args))
+	for i, a := range args {
+		params[i] = []byte(a)
+	}
+	return params
 }
 
 // query is run for internal catalog queries whose columns we already know.
@@ -239,7 +270,7 @@ func describe(ctx context.Context, pc *pgconn.PgConn, fds []pgconn.FieldDescript
 // RunSQL runs one user statement read-only. SELECT-like statements go through
 // a cursor so only sqlRowCap+1 rows ever leave the server; anything a cursor
 // can't wrap (SHOW, EXPLAIN, a write that Postgres will refuse) runs directly.
-func RunSQL(ctx context.Context, pool *pgxpool.Pool, sql string) (*Result, error) {
+func (p pg) RunSQL(ctx context.Context, sql string) (*Result, error) {
 	sql = strings.TrimRight(strings.TrimSpace(sql), "; \t\r\n")
 	if sql == "" {
 		return nil, userErr("nothing to run")
@@ -248,7 +279,7 @@ func RunSQL(ctx context.Context, pool *pgxpool.Pool, sql string) (*Result, error
 	start := time.Now()
 	res := &Result{}
 	direct := false
-	err := readOnly(ctx, pool, func(pc *pgconn.PgConn) error {
+	err := readOnly(ctx, p.pool, func(pc *pgconn.PgConn) error {
 		if _, err := pc.ExecParams(ctx, prefix+sql, nil, nil, nil, nil).Close(); err != nil {
 			var pe *pgconn.PgError
 			if errors.As(err, &pe) && (pe.Code == "42601" || pe.Code == "0A000") {
@@ -268,7 +299,7 @@ func RunSQL(ctx context.Context, pool *pgxpool.Pool, sql string) (*Result, error
 		return describe(ctx, pc, fds, res)
 	})
 	if err == nil && direct {
-		err = readOnly(ctx, pool, func(pc *pgconn.PgConn) error {
+		err = readOnly(ctx, p.pool, func(pc *pgconn.PgConn) error {
 			fds, err := run(ctx, pc, sql, nil, sqlRowCap, res)
 			if err != nil || len(fds) == 0 {
 				return err
@@ -284,9 +315,9 @@ func RunSQL(ctx context.Context, pool *pgxpool.Pool, sql string) (*Result, error
 }
 
 // Databases lists the databases a connection can open.
-func Databases(ctx context.Context, pool *pgxpool.Pool) ([]string, error) {
+func (p pg) Databases(ctx context.Context) ([]string, error) {
 	var res Result
-	err := readOnly(ctx, pool, func(pc *pgconn.PgConn) error {
+	err := readOnly(ctx, p.pool, func(pc *pgconn.PgConn) error {
 		return query(ctx, pc, `SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1`, nil, 10000, &res)
 	})
 	out := make([]string, len(res.Rows))
@@ -304,9 +335,9 @@ type Relation struct {
 }
 
 // Tree lists user-visible tables and views with planner row estimates.
-func Tree(ctx context.Context, pool *pgxpool.Pool) ([]Relation, error) {
+func (p pg) Tree(ctx context.Context) ([]Relation, error) {
 	var res Result
-	err := readOnly(ctx, pool, func(pc *pgconn.PgConn) error {
+	err := readOnly(ctx, p.pool, func(pc *pgconn.PgConn) error {
 		return query(ctx, pc, `
 			SELECT n.nspname, c.relname, c.relkind::text, c.reltuples::bigint
 			FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -340,9 +371,15 @@ type RowsReq struct {
 
 var compareOps = map[string]bool{"=": true, "!=": true, "<": true, "<=": true, ">": true, ">=": true}
 
-// tableQuery builds the SELECT for a table view (search, filters, sort).
-// Column names are checked against the catalog and quoted; every user value
-// is a parameter.
+// dialect is all that differs in the SQL we build for each engine.
+type dialect struct{ param, ilike string }
+
+var (
+	pgSQL   = dialect{"$", "ILIKE"}
+	liteSQL = dialect{"?", "LIKE"} // SQLite's LIKE ignores ASCII case
+)
+
+// tableQuery builds the SELECT for a Postgres table view.
 func tableQuery(ctx context.Context, pc *pgconn.PgConn, req RowsReq) (sql string, args []string, cols []Column, total int64, err error) {
 	var meta Result
 	err = query(ctx, pc, `
@@ -362,47 +399,57 @@ func tableQuery(ctx context.Context, pc *pgconn.PgConn, req RowsReq) (sql string
 		return
 	}
 	cols = make([]Column, len(meta.Rows))
-	byName := map[string]Column{}
-	var names, pks []string
 	for i, r := range meta.Rows {
 		cols[i] = Column{Name: *r[0], Type: *r[1], PK: *r[2] == "true"}
-		byName[cols[i].Name] = cols[i]
-		names = append(names, ident(cols[i].Name))
-		if cols[i].PK {
-			pks = append(pks, ident(cols[i].Name))
-		}
 	}
 	total, _ = strconv.ParseInt(*meta.Rows[0][3], 10, 64)
+	sql, args, err = selectSQL(pgSQL, req, cols)
+	if strings.TrimSpace(req.Q) != "" || len(req.Filters) > 0 {
+		total = 0 // the estimate is for the whole table
+	}
+	return
+}
 
+// selectSQL builds a table view's SELECT (search, filters, sort). Column
+// names are checked against cols and quoted; every user value is an untyped
+// parameter, so the database takes its type from the column it's compared to.
+func selectSQL(d dialect, req RowsReq, cols []Column) (sql string, args []string, err error) {
+	byName := map[string]Column{}
+	var names, pks []string
+	for _, c := range cols {
+		byName[c.Name] = c
+		names = append(names, ident(c.Name))
+		if c.PK {
+			pks = append(pks, ident(c.Name))
+		}
+	}
 	var where []string
-	arg := func(v string) string { args = append(args, v); return "$" + strconv.Itoa(len(args)) }
+	arg := func(v string) string { args = append(args, v); return d.param + strconv.Itoa(len(args)) }
 	if q := strings.TrimSpace(req.Q); q != "" {
 		p := arg("%" + likeEscape(q) + "%")
 		var ors []string
 		for _, n := range names {
-			ors = append(ors, n+"::text ILIKE "+p)
+			ors = append(ors, "CAST("+n+" AS TEXT) "+d.ilike+" "+p+` ESCAPE '\'`)
 		}
 		where = append(where, "("+strings.Join(ors, " OR ")+")")
 	}
 	for _, f := range req.Filters {
 		col, ok := byName[f.Col]
 		if !ok {
-			err = userErr("unknown column " + strconv.Quote(f.Col))
-			return
+			return "", nil, userErr("unknown column " + strconv.Quote(f.Col))
 		}
 		c := ident(col.Name)
 		switch {
 		case compareOps[f.Op]:
-			where = append(where, c+" "+f.Op+" "+arg(f.Val)+"::"+col.Type)
+			where = append(where, c+" "+f.Op+" "+arg(f.Val))
 		case f.Op == "contains":
-			where = append(where, c+"::text ILIKE "+arg("%"+likeEscape(f.Val)+"%"))
+			where = append(where, "CAST("+c+" AS TEXT) "+d.ilike+" "+arg("%"+likeEscape(f.Val)+"%")+` ESCAPE '\'`)
 		case f.Op == "is null":
 			where = append(where, c+" IS NULL")
 		case f.Op == "is not null":
 			where = append(where, c+" IS NOT NULL")
 		default:
-			err = userErr("unknown operator " + strconv.Quote(f.Op))
-			return
+			return "", nil, userErr("unknown operator " + strconv.Quote(f.Op))
 		}
 	}
 
@@ -410,8 +457,7 @@ func tableQuery(ctx context.Context, pc *pgconn.PgConn, req RowsReq) (sql string
 	if req.Sort != "" {
 		col, ok := byName[req.Sort]
 		if !ok {
-			err = userErr("unknown column " + strconv.Quote(req.Sort))
-			return
+			return "", nil, userErr("unknown column " + strconv.Quote(req.Sort))
 		}
 		dir := " ASC NULLS LAST"
 		if req.Desc {
@@ -428,22 +474,18 @@ func tableQuery(ctx context.Context, pc *pgconn.PgConn, req RowsReq) (sql string
 	sql = "SELECT " + strings.Join(names, ", ") + " FROM " + pgx.Identifier{req.Schema, req.Table}.Sanitize()
 	if len(where) > 0 {
 		sql += " WHERE " + strings.Join(where, " AND ")
-		total = 0 // the estimate is for the whole table
 	}
 	if len(order) > 0 {
 		sql += " ORDER BY " + strings.Join(order, ", ")
 	}
-	return
+	return sql, args, nil
 }
 
 // Rows returns one page of a table or view.
-func Rows(ctx context.Context, pool *pgxpool.Pool, req RowsReq) (*Result, error) {
-	if req.Page < 0 || req.Page > 1_000_000 {
-		return nil, userErr("bad page")
-	}
+func (p pg) Rows(ctx context.Context, req RowsReq) (*Result, error) {
 	start := time.Now()
 	res := &Result{}
-	err := readOnly(ctx, pool, func(pc *pgconn.PgConn) error {
+	err := readOnly(ctx, p.pool, func(pc *pgconn.PgConn) error {
 		sql, args, cols, total, err := tableQuery(ctx, pc, req)
 		if err != nil {
 			return err
@@ -467,8 +509,8 @@ type ExportReq struct {
 // Export streams every row of a table view or query as CSV, without the UI's
 // row and cell caps. begin is called once the first row (or the end of an
 // empty result) arrives; an error before that is an ordinary API error.
-func Export(ctx context.Context, pool *pgxpool.Pool, req ExportReq, begin func() io.Writer) error {
-	return readOnly(ctx, pool, func(pc *pgconn.PgConn) error {
+func (p pg) Export(ctx context.Context, req ExportReq, begin func() io.Writer) error {
+	return readOnly(ctx, p.pool, func(pc *pgconn.PgConn) error {
 		if _, err := pc.Exec(ctx, "SET LOCAL statement_timeout = '10min'").ReadAll(); err != nil {
 			return err
 		}
@@ -479,11 +521,7 @@ func Export(ctx context.Context, pool *pgxpool.Pool, req ExportReq, begin func()
 				return err
 			}
 		}
-		params := make([][]byte, len(args))
-		for i, a := range args {
-			params[i] = []byte(a)
-		}
-		rr := pc.ExecParams(ctx, sql, params, nil, nil, nil)
+		rr := pc.ExecParams(ctx, sql, textParams(args), nil, nil, nil)
 		var w *bufio.Writer
 		start := func() {
 			w = bufio.NewWriterSize(begin(), 64<<10)
@@ -548,9 +586,9 @@ var structureQueries = []struct{ name, sql string }{
 }
 
 // Structure describes a table: columns, indexes and foreign keys both ways.
-func Structure(ctx context.Context, pool *pgxpool.Pool, schema, table string) (map[string]*Result, error) {
+func (p pg) Structure(ctx context.Context, schema, table string) (map[string]*Result, error) {
 	out := map[string]*Result{}
-	err := readOnly(ctx, pool, func(pc *pgconn.PgConn) error {
+	err := readOnly(ctx, p.pool, func(pc *pgconn.PgConn) error {
 		for _, q := range structureQueries {
 			res := &Result{}
 			fds, err := run(ctx, pc, q.sql, []string{ident(schema) + "." + ident(table)}, 10000, res)
@@ -583,74 +621,83 @@ type EditReq struct {
 }
 
 // Edit applies every change in one READ WRITE transaction, all or nothing.
-// It's the only code that writes, and it runs only statements it builds:
-// quoted identifiers, and every value a parameter. Parameters are untyped, so
-// Postgres takes each one's type from its column and rejects unknown columns.
-func Edit(ctx context.Context, pool *pgxpool.Pool, req EditReq) error {
-	return inTx(ctx, pool, pgx.ReadWrite, func(pc *pgconn.PgConn) error {
+// It's the only Postgres code that writes.
+func (p pg) Edit(ctx context.Context, req EditReq) error {
+	return inTx(ctx, p.pool, pgx.ReadWrite, func(pc *pgconn.PgConn) error {
 		_, _, cols, _, err := tableQuery(ctx, pc, RowsReq{Schema: req.Schema, Table: req.Table})
 		if err != nil {
 			return err
 		}
-		pk := map[string]bool{}
-		for _, c := range cols {
-			if c.PK {
-				pk[c.Name] = true
-			}
-		}
-		if len(pk) == 0 {
-			return userErr("only tables with a primary key can be edited")
-		}
-		table := pgx.Identifier{req.Schema, req.Table}.Sanitize()
-		for i, ch := range req.Changes {
-			var params [][]byte
-			arg := func(v *string) string {
-				var b []byte // nil is NULL
-				if v != nil {
-					b = append([]byte{}, *v...)
-				}
-				params = append(params, b)
-				return "$" + strconv.Itoa(len(params))
-			}
-			var names, vals, set, where []string
-			for name, v := range ch.Set {
-				names, vals = append(names, ident(name)), append(vals, arg(v))
-				set = append(set, ident(name)+" = "+vals[len(vals)-1])
-			}
-			keys := 0
-			for name, v := range ch.Key {
-				if pk[name] { // compared as its own type, so the primary key index is used
-					keys++
-					where = append(where, ident(name)+" = "+arg(v))
-				} else { // compared as text, which works for every type, json included
-					where = append(where, ident(name)+"::text IS NOT DISTINCT FROM "+arg(v))
-				}
-			}
-			var sql string
-			switch {
-			case ch.Op == "insert" && len(ch.Key) > 0, ch.Op != "insert" && keys < len(pk):
-				return userErr(fmt.Sprintf("change %d: an update or delete needs the whole primary key, and an insert none", i+1))
-			case ch.Op == "insert" && len(names) == 0:
-				sql = "INSERT INTO " + table + " DEFAULT VALUES"
-			case ch.Op == "insert":
-				sql = "INSERT INTO " + table + " (" + strings.Join(names, ", ") + ") VALUES (" + strings.Join(vals, ", ") + ")"
-			case ch.Op == "update" && len(set) > 0:
-				sql = "UPDATE " + table + " SET " + strings.Join(set, ", ") + " WHERE " + strings.Join(where, " AND ")
-			case ch.Op == "delete":
-				sql = "DELETE FROM " + table + " WHERE " + strings.Join(where, " AND ")
-			default:
-				return userErr(fmt.Sprintf("change %d: bad change", i+1))
-			}
-			tag, err := pc.ExecParams(ctx, sql, params, nil, nil, nil).Close()
-			if err != nil {
-				return err
-			}
-			if tag.RowsAffected() != 1 {
-				return userErr(fmt.Sprintf("change %d: the row was changed or deleted since it was loaded; nothing was applied", i+1))
-			}
-		}
-		return nil
+		return applyChanges(pgSQL, req, cols, func(sql string, args []string) (int64, error) {
+			tag, err := pc.ExecParams(ctx, sql, textParams(args), nil, nil, nil).Close()
+			return tag.RowsAffected(), err
+		})
 	})
+}
+
+// applyChanges runs each change through exec, which reports the rows it
+// changed; the caller's transaction makes it all or nothing. It runs only
+// statements it builds: quoted identifiers, and every value an untyped
+// parameter (NULL is written as NULL), so the database takes each value's
+// type from its column and rejects unknown columns.
+func applyChanges(d dialect, req EditReq, cols []Column, exec func(sql string, args []string) (int64, error)) error {
+	pk := map[string]bool{}
+	for _, c := range cols {
+		if c.PK {
+			pk[c.Name] = true
+		}
+	}
+	if len(pk) == 0 {
+		return userErr("only tables with a primary key can be edited")
+	}
+	table := pgx.Identifier{req.Schema, req.Table}.Sanitize()
+	for i, ch := range req.Changes {
+		var args []string
+		arg := func(v *string) string {
+			if v == nil {
+				return "NULL"
+			}
+			args = append(args, *v)
+			return d.param + strconv.Itoa(len(args))
+		}
+		var names, vals, set, where []string
+		for name, v := range ch.Set {
+			names, vals = append(names, ident(name)), append(vals, arg(v))
+			set = append(set, ident(name)+" = "+vals[len(vals)-1])
+		}
+		keys := 0
+		for name, v := range ch.Key {
+			if pk[name] { // compared as its own type, so the primary key index is used
+				keys++
+				where = append(where, ident(name)+" = "+arg(v))
+			} else { // compared as text, which works for every type, json included
+				where = append(where, "CAST("+ident(name)+" AS TEXT) IS NOT DISTINCT FROM "+arg(v))
+			}
+		}
+		var sql string
+		switch {
+		case ch.Op == "insert" && len(ch.Key) > 0, ch.Op != "insert" && keys < len(pk):
+			return userErr(fmt.Sprintf("change %d: an update or delete needs the whole primary key, and an insert none", i+1))
+		case ch.Op == "insert" && len(names) == 0:
+			sql = "INSERT INTO " + table + " DEFAULT VALUES"
+		case ch.Op == "insert":
+			sql = "INSERT INTO " + table + " (" + strings.Join(names, ", ") + ") VALUES (" + strings.Join(vals, ", ") + ")"
+		case ch.Op == "update" && len(set) > 0:
+			sql = "UPDATE " + table + " SET " + strings.Join(set, ", ") + " WHERE " + strings.Join(where, " AND ")
+		case ch.Op == "delete":
+			sql = "DELETE FROM " + table + " WHERE " + strings.Join(where, " AND ")
+		default:
+			return userErr(fmt.Sprintf("change %d: bad change", i+1))
+		}
+		n, err := exec(sql, args)
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return userErr(fmt.Sprintf("change %d: the row was changed or deleted since it was loaded; nothing was applied", i+1))
+		}
+	}
+	return nil
 }
 
 func ident(s string) string { return pgx.Identifier{s}.Sanitize() }
@@ -661,6 +708,9 @@ func likeEscape(s string) string {
 
 // TestConn dials once without a pool and reports the server version.
 func TestConn(ctx context.Context, c Conn) (string, error) {
+	if c.Engine == "sqlite" {
+		return lite{c.Path}.version(ctx)
+	}
 	cfg, err := pgx.ParseConfig(c.DSN(c.Database))
 	if err != nil {
 		return "", userErr("invalid connection settings: " + err.Error())
@@ -673,5 +723,5 @@ func TestConn(ctx context.Context, c Conn) (string, error) {
 	defer conn.Close(context.Background())
 	var v string
 	err = conn.QueryRow(ctx, "SHOW server_version").Scan(&v)
-	return v, err
+	return "PostgreSQL " + v, err
 }

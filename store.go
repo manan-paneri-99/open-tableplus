@@ -11,12 +11,17 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/zalando/go-keyring"
 )
 
-// Conn is a saved connection. Password is empty when ~/.pgpass should be used.
+// Conn is a saved connection. Password is empty when ~/.pgpass should be used;
+// on disk it's also empty when the OS keychain holds it.
 type Conn struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
+	Engine   string `json:"engine,omitempty"` // "" is Postgres, or "sqlite"
+	Path     string `json:"path,omitempty"`   // the SQLite file
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
 	User     string `json:"user"`
@@ -63,7 +68,11 @@ func (c Conn) validate() error {
 	switch {
 	case strings.TrimSpace(c.Name) == "":
 		return userErr("name is required")
-	case strings.TrimSpace(c.Host) == "":
+	case c.Engine != "" && c.Engine != "sqlite":
+		return userErr("engine must be postgres or sqlite")
+	case c.Engine == "sqlite" && strings.TrimSpace(c.Path) == "":
+		return userErr("file path is required")
+	case c.Engine == "" && strings.TrimSpace(c.Host) == "":
 		return userErr("host is required")
 	case c.Port < 0 || c.Port > 65535:
 		return userErr("port must be 1-65535")
@@ -83,11 +92,16 @@ type HistoryEntry struct {
 	Info string `json:"info"` // "SELECT 3 · 5 ms", or the SQLSTATE on error
 }
 
-// Store keeps connections and query history in two 0600 JSON files.
+// keyringService names our items in the OS keychain; each account is a connection ID.
+const keyringService = "open-tableplus"
+
+// Store keeps connections and query history in two 0600 JSON files, and
+// passwords in the OS keychain.
 type Store struct {
 	mu       sync.Mutex
 	path     string
-	conns    []Conn
+	conns    []Conn          // with passwords
+	inFile   map[string]bool // connections whose password the keychain refused: kept in the file
 	histPath string
 	history  map[string][]HistoryEntry // key: connection ID + "/" + database
 }
@@ -99,12 +113,43 @@ func OpenStore(dir string) (*Store, error) {
 	s := &Store{
 		path:     filepath.Join(dir, "connections.json"),
 		histPath: filepath.Join(dir, "history.json"),
+		inFile:   map[string]bool{},
 		history:  map[string][]HistoryEntry{},
 	}
 	if err := loadJSON(s.path, &s.conns); err != nil {
 		return nil, err
 	}
+	migrate := false
+	for i, c := range s.conns {
+		var err error
+		switch {
+		case c.Password != "": // plaintext from before v0.5, or the keychain refused it last time
+			migrate = s.keep(c) || migrate
+		case c.Engine == "":
+			if s.conns[i].Password, err = keyring.Get(keyringService, c.ID); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+				log.Printf("reading the password for %q from the keychain: %v", c.Name, err)
+			}
+		}
+	}
+	if migrate {
+		if err := s.save(); err != nil {
+			return nil, err
+		}
+	}
 	return s, loadJSON(s.histPath, &s.history)
+}
+
+// keep stores c's password in the keychain, or, if there's no usable keychain
+// (e.g. Linux without a Secret Service), marks it to stay in the 0600 file.
+// It reports whether the password is now in the keychain.
+func (s *Store) keep(c Conn) bool {
+	if err := keyring.Set(keyringService, c.ID, c.Password); err != nil {
+		log.Printf("keychain unavailable, so the password for %q stays in connections.json: %v", c.Name, err)
+		s.inFile[c.ID] = true
+		return false
+	}
+	delete(s.inFile, c.ID)
+	return true
 }
 
 func loadJSON(path string, v any) error {
@@ -160,11 +205,17 @@ func (s *Store) Put(c Conn) (Conn, error) {
 		b := make([]byte, 6)
 		rand.Read(b)
 		c.ID = hex.EncodeToString(b)
+		if c.Password != "" {
+			s.keep(c)
+		}
 		s.conns = append(s.conns, c)
 		return c, s.save()
 	}
 	for i := range s.conns {
 		if s.conns[i].ID == c.ID {
+			if c.Password != "" {
+				s.keep(c)
+			}
 			s.conns[i] = c
 			return c, s.save()
 		}
@@ -177,6 +228,8 @@ func (s *Store) Delete(id string) error {
 	defer s.mu.Unlock()
 	for i := range s.conns {
 		if s.conns[i].ID == id {
+			keyring.Delete(keyringService, id) // ErrNotFound when there was no password
+			delete(s.inFile, id)
 			s.conns = append(s.conns[:i], s.conns[i+1:]...)
 			for key := range s.history {
 				if strings.HasPrefix(key, id+"/") {
@@ -192,7 +245,16 @@ func (s *Store) Delete(id string) error {
 	return notFound("connection")
 }
 
-func (s *Store) save() error { return writeJSON(s.path, s.conns) }
+// save writes connections.json without the passwords the keychain holds.
+func (s *Store) save() error {
+	out := append([]Conn{}, s.conns...)
+	for i := range out {
+		if !s.inFile[out[i].ID] {
+			out[i].Password = ""
+		}
+	}
+	return writeJSON(s.path, out)
+}
 
 // Remember records a statement: newest first, a repeated statement moves to
 // the top, at most historyCap per connection/database. History is a

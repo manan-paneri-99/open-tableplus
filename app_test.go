@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -20,17 +21,24 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ncruces/go-sqlite3"
+	"github.com/zalando/go-keyring"
 )
 
 const devPort = 55432
 
-func init() { appName = "open-tableplus-test" } // don't count a dev server running alongside
+func init() {
+	appName = "open-tableplus-test" // don't count a dev server running alongside
+	keyring.MockInit()              // never touch the real keychain
+}
 
 type env struct {
 	t     *testing.T
 	url   string
 	token string
 	conn  string // id of the fixture connection
+	db    string // the database the sql and export helpers use
 	dir   string // config dir
 }
 
@@ -41,6 +49,16 @@ func setup(t *testing.T) *env {
 	} else {
 		c.Close()
 	}
+	e := serve(t)
+	var c ConnView
+	e.must("PUT", "/api/conns", Conn{Name: "fixture", Host: "127.0.0.1", Port: devPort, User: "postgres", Database: "fixture_a", SSLMode: "disable"}, &c)
+	e.conn, e.db = c.ID, "fixture_a"
+	return e
+}
+
+// serve starts the app on a fresh config dir, with no connections.
+func serve(t *testing.T) *env {
+	t.Helper()
 	dir := t.TempDir()
 	store, err := OpenStore(dir)
 	if err != nil {
@@ -62,11 +80,7 @@ func setup(t *testing.T) *env {
 		}
 	})
 
-	e := &env{t: t, url: srv.URL, token: token, dir: dir}
-	var c ConnView
-	e.must("PUT", "/api/conns", Conn{Name: "fixture", Host: "127.0.0.1", Port: devPort, User: "postgres", Database: "fixture_a", SSLMode: "disable"}, &c)
-	e.conn = c.ID
-	return e
+	return &env{t: t, url: srv.URL, token: token, dir: dir}
 }
 
 // call does an authenticated request and returns status and body.
@@ -109,7 +123,7 @@ func (e *env) rows(db string, req RowsReq) Result {
 
 func (e *env) sql(sql string) (int, Result, apiError) {
 	e.t.Helper()
-	status, b, err := e.call(context.Background(), "POST", "/api/c/"+e.conn+"/fixture_a/sql", map[string]string{"sql": sql})
+	status, b, err := e.call(context.Background(), "POST", "/api/c/"+e.conn+"/"+e.db+"/sql", map[string]string{"sql": sql})
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -512,7 +526,7 @@ func TestStoreFileMode(t *testing.T) {
 func (e *env) export(ctx context.Context, req any) (int, http.Header, []byte) {
 	e.t.Helper()
 	b, _ := json.Marshal(req)
-	r, _ := http.NewRequestWithContext(ctx, "POST", e.url+"/api/c/"+e.conn+"/fixture_a/export",
+	r, _ := http.NewRequestWithContext(ctx, "POST", e.url+"/api/c/"+e.conn+"/"+e.db+"/export",
 		strings.NewReader(url.Values{"req": {string(b)}}.Encode()))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	r.AddCookie(&http.Cookie{Name: "open_tableplus", Value: e.token})
@@ -775,5 +789,262 @@ func TestEdit(t *testing.T) {
 	}
 	if psql(t, "fixture_b", `SELECT count(*) FROM public.notes`) != "3" {
 		t.Errorf("refused edits changed rows: %s", notes())
+	}
+}
+
+func TestKeychain(t *testing.T) {
+	dir := t.TempDir()
+	// A plaintext password from before v0.5 moves into the keychain on load.
+	os.WriteFile(dir+"/connections.json", []byte(`[{"id":"old1","name":"old","host":"h","password":"pre-v05"}]`), 0o600)
+	s, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.Put(Conn{Name: "new", Host: "h", Password: "s3cret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file, _ := os.ReadFile(dir + "/connections.json"); strings.Contains(string(file), "pre-v05") || strings.Contains(string(file), "s3cret") {
+		t.Errorf("password in the file: %s", file)
+	}
+	for id, want := range map[string]string{"old1": "pre-v05", c.ID: "s3cret"} {
+		if got, err := keyring.Get(keyringService, id); got != want {
+			t.Errorf("keychain %s: %q %v", id, got, err)
+		}
+	}
+	// Reopening reads it back; deleting the connection removes it.
+	s, _ = OpenStore(dir)
+	if got, _ := s.Get(c.ID); got.Password != "s3cret" {
+		t.Errorf("not read back: %q", got.Password)
+	}
+	s.Delete(c.ID)
+	if _, err := keyring.Get(keyringService, c.ID); !errors.Is(err, keyring.ErrNotFound) {
+		t.Errorf("left in the keychain: %v", err)
+	}
+
+	// Without a usable keychain, saving works and the password stays in the 0600 file.
+	keyring.MockInitWithError(errors.New("no Secret Service"))
+	defer keyring.MockInit()
+	dir = t.TempDir()
+	s, _ = OpenStore(dir)
+	if _, err := s.Put(Conn{Name: "x", Host: "h", Password: "kept"}); err != nil {
+		t.Fatal(err)
+	}
+	s, _ = OpenStore(dir)
+	if file, _ := os.ReadFile(dir + "/connections.json"); !strings.Contains(string(file), "kept") || !s.List()[0].HasPassword {
+		t.Errorf("password lost without a keychain: %s", file)
+	}
+}
+
+const liteFixture = `
+CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL, nickname TEXT, balance REAL, big INTEGER, created DATETIME, avatar BLOB, active BOOLEAN DEFAULT 1);
+INSERT INTO users VALUES
+  (1, 'ada@example.com', NULL, 1.5, 9223372036854775807, '2026-01-02 03:04:05.123456', x'deadbeef', 1),
+  (2, 'bob@example.com', '', 0.0, -1, '1999-12-31', x'', 0),
+  (3, 'cyd@example.com', 'cy', -2.25, 0, NULL, NULL, NULL),
+  (4, 'dee@example.com', 'dee 100% _real_', NULL, 42, 'not a date', x'00', 1);
+CREATE TABLE events (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users (id), kind TEXT);
+INSERT INTO events WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM g WHERE n < 250) SELECT n, n % 2 + 1, 'k' || (n % 3) FROM g;
+CREATE INDEX events_user_kind_idx ON events (user_id, kind);
+CREATE TABLE logs (msg TEXT, level INT);
+INSERT INTO logs VALUES ('boot', 1), ('warn', 2);
+CREATE VIEW active_users AS SELECT id, email FROM users WHERE active;
+`
+
+// liteSetup writes the SQLite fixture to a file and adds a connection to it.
+func liteSetup(t *testing.T) (*env, string) {
+	t.Helper()
+	path := t.TempDir() + "/fixture.db"
+	liteExec(t, path, liteFixture)
+	e := serve(t)
+	var c ConnView
+	e.must("PUT", "/api/conns", Conn{Name: "lite", Engine: "sqlite", Path: path}, &c)
+	e.conn, e.db = c.ID, "main"
+	return e, path
+}
+
+// liteExec writes to the file directly, as another program would.
+func liteExec(t *testing.T, path, sql string) {
+	t.Helper()
+	c, err := sqlite3.Open(path)
+	if err == nil {
+		err = c.Exec(sql)
+		c.Close()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func liteVal(t *testing.T, path, sql string) string {
+	t.Helper()
+	var res Result
+	if err := (lite{path}).with(context.Background(), false, func(c *sqlite3.Conn) error { return liteQuery(c, sql, nil, 1, &res) }); err != nil {
+		t.Fatal(err)
+	}
+	return *res.Rows[0][0]
+}
+
+func TestSQLite(t *testing.T) {
+	e, path := liteSetup(t)
+	ctx := context.Background()
+	var v map[string]string
+	e.must("POST", "/api/conns/test", Conn{Engine: "sqlite", Path: path}, &v)
+	if !strings.HasPrefix(v["version"], "SQLite 3.") {
+		t.Errorf("version %q", v["version"])
+	}
+	// A missing file is an error, and isn't created.
+	if status, b, _ := e.call(ctx, "POST", "/api/conns/test", Conn{Engine: "sqlite", Path: path + ".nope"}); status == 200 {
+		t.Errorf("missing file: %d %s", status, b)
+	}
+	if _, err := os.Stat(path + ".nope"); err == nil {
+		t.Error("missing file was created")
+	}
+
+	var dbs []string
+	var tree []Relation
+	e.must("GET", "/api/c/"+e.conn+"/dbs", nil, &dbs)
+	e.must("GET", "/api/c/"+e.conn+"/main/tree", nil, &tree)
+	if fmt.Sprint(dbs, tree) != "[main] [{main active_users v 0} {main events r 0} {main logs r 0} {main users r 0}]" {
+		t.Errorf("dbs and tree: %v %v", dbs, tree)
+	}
+
+	// Values are SQLite's own text, blobs \x hex; NULL and '' stay distinct.
+	r := e.rows("main", RowsReq{Schema: "main", Table: "users"})
+	for _, tc := range []struct {
+		row       int
+		col, want string
+	}{
+		{0, "balance", "1.5"}, {1, "balance", "0.0"}, {0, "big", "9223372036854775807"},
+		{0, "created", "2026-01-02 03:04:05.123456"}, {1, "created", "1999-12-31"}, {3, "created", "not a date"},
+		{0, "avatar", `\xdeadbeef`}, {1, "avatar", `\x`}, {1, "nickname", ""},
+	} {
+		if got := cell(r, tc.row, tc.col); got == nil || *got != tc.want {
+			t.Errorf("row %d %s: %v, want %q", tc.row, tc.col, got, tc.want)
+		}
+	}
+	if cell(r, 0, "nickname") != nil || cell(r, 2, "avatar") != nil || !r.Columns[0].PK || r.Columns[5].Type != "DATETIME" {
+		t.Errorf("nulls, key or types: %+v", r.Columns)
+	}
+
+	// Search ignores case and takes % literally; filters compare as the column's type.
+	for _, tc := range []struct {
+		req  RowsReq
+		want string
+	}{
+		{RowsReq{Q: "DEE"}, "4"},
+		{RowsReq{Q: "100%"}, "4"},
+		{RowsReq{Filters: []Filter{{"balance", ">", "1"}}}, "1"},
+		{RowsReq{Filters: []Filter{{"created", "is null", ""}}}, "3"},
+		{RowsReq{Filters: []Filter{{"email", "contains", "BOB"}}}, "2"},
+		{RowsReq{Filters: []Filter{{"id", ">=", "3"}}, Sort: "id", Desc: true}, "4,3"},
+	} {
+		tc.req.Schema, tc.req.Table = "main", "users"
+		if got := ids(e.rows("main", tc.req)); got != tc.want {
+			t.Errorf("%+v: %s, want %s", tc.req, got, tc.want)
+		}
+	}
+	if p := e.rows("main", RowsReq{Schema: "main", Table: "events", Page: 2}); len(p.Rows) != 50 || p.More || *p.Rows[0][0] != "201" {
+		t.Errorf("last page: %d rows, more %v", len(p.Rows), p.More)
+	}
+
+	// The SQL tab runs one statement, read-only.
+	if status, res, ae := e.sql("SELECT email, length(avatar) AS n FROM users WHERE id = 1; -- trailing comment"); status != 200 || res.Tag != "SELECT 1" || *cell(res, 0, "n") != "4" {
+		t.Errorf("select: %d %+v %+v", status, res, ae)
+	}
+	for _, q := range []string{"SELECT 1; SELECT 2", "DELETE FROM users", "UPDATE users SET big = 1", "ATTACH 'other.db' AS o", "SELEC 1"} {
+		if status, _, ae := e.sql(q); status == 200 || ae.Error == "" {
+			t.Errorf("%q: %d %+v", q, status, ae)
+		}
+	}
+	if n := liteVal(t, path, "SELECT count(*) || sum(big = 1) FROM users"); n != "40" {
+		t.Errorf("SQL tab wrote: %s", n)
+	}
+	var hist []HistoryEntry
+	if e.must("GET", "/api/c/"+e.conn+"/main/history", nil, &hist); len(hist) != 6 || hist[0].SQL != "SELEC 1" || hist[0].OK {
+		t.Errorf("history: %+v", hist)
+	}
+
+	// Export streams every row; NULL is empty and '' is "".
+	status, _, body := e.export(ctx, ExportReq{RowsReq: RowsReq{Schema: "main", Table: "users"}})
+	if want := "id,email,nickname,balance,big,created,avatar,active\r\n" +
+		"1,ada@example.com,,1.5,9223372036854775807,2026-01-02 03:04:05.123456,\\xdeadbeef,1\r\n" +
+		`2,bob@example.com,"",0.0,-1,1999-12-31,\x,0` + "\r\n"; status != 200 || !strings.HasPrefix(string(body), want) {
+		t.Errorf("export: %d\n%s", status, body)
+	}
+	if status, _, body := e.export(ctx, ExportReq{SQL: "SELECT count(*) AS n FROM events"}); status != 200 || string(body) != "n\r\n250\r\n" {
+		t.Errorf("export SQL: %d %q", status, body)
+	}
+
+	// Structure: columns, indexes, and foreign keys both ways.
+	var ev, us map[string]Result
+	e.must("GET", "/api/c/"+e.conn+"/main/structure?schema=main&table=events", nil, &ev)
+	e.must("GET", "/api/c/"+e.conn+"/main/structure?schema=main&table=users", nil, &us)
+	if len(ev["columns"].Rows) != 3 || *ev["indexes"].Rows[0][0] != "events_user_kind_idx" ||
+		*ev["foreignKeys"].Rows[0][0] != "FOREIGN KEY (user_id) REFERENCES users(id)" || *us["referencedBy"].Rows[0][0] != "events" {
+		t.Errorf("structure: %+v %+v", ev, us["referencedBy"])
+	}
+}
+
+func TestSQLiteEdit(t *testing.T) {
+	e, path := liteSetup(t)
+	s := func(v string) *string { return &v }
+	edit := func(table string, ch ...Change) (int, string) {
+		status, b, err := e.call(context.Background(), "POST", "/api/c/"+e.conn+"/main/edit", EditReq{Schema: "main", Table: table, Changes: ch})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return status, string(b)
+	}
+	users := func() string {
+		return liteVal(t, path, `SELECT group_concat(id || '|' || coalesce(nickname, 'NULL') || '|' || coalesce(big, 'NULL'), ' ') FROM (SELECT * FROM users ORDER BY id)`)
+	}
+
+	if status, b := edit("users", Change{Op: "delete", Key: map[string]*string{"id": s("1")}}); status != 400 || !strings.Contains(b, "editing is off") {
+		t.Fatalf("edit without opt-in: %d %s", status, b)
+	}
+	e.must("PUT", "/api/conns", Conn{ID: e.conn, Name: "lite", Engine: "sqlite", Path: path, Editable: true}, nil)
+	if status, _, _ := e.sql("DELETE FROM logs"); status == 200 {
+		t.Error("SQL tab wrote with editing on")
+	}
+
+	// Update, insert and delete; NULL, '' and 0 stay distinct and take the column's type.
+	status, b := edit("users",
+		Change{Op: "update", Key: map[string]*string{"id": s("1"), "nickname": nil}, Set: map[string]*string{"nickname": s(""), "big": s("0")}},
+		Change{Op: "update", Key: map[string]*string{"id": s("2"), "nickname": s("")}, Set: map[string]*string{"nickname": nil}},
+		Change{Op: "insert", Set: map[string]*string{"id": s("5"), "email": s("eve@example.com")}},
+		Change{Op: "delete", Key: map[string]*string{"id": s("3"), "nickname": s("cy"), "created": nil}},
+	)
+	if want := "1||0 2|NULL|-1 4|dee 100% _real_|42 5|NULL|NULL"; status != 200 || users() != want || liteVal(t, path, "SELECT typeof(big) FROM users WHERE id = 1") != "integer" {
+		t.Fatalf("apply: %d %s\n got %s\nwant %s", status, b, users(), want)
+	}
+	before := users()
+
+	// All or nothing: a NOT NULL violation in the last change rolls back the first.
+	if status, b := edit("users",
+		Change{Op: "update", Key: map[string]*string{"id": s("1")}, Set: map[string]*string{"nickname": s("x")}},
+		Change{Op: "update", Key: map[string]*string{"id": s("4")}, Set: map[string]*string{"email": nil}},
+	); status != 422 || users() != before {
+		t.Errorf("partial apply: %d %s %s", status, b, users())
+	}
+
+	// A concurrent change wins: nothing is applied.
+	liteExec(t, path, `UPDATE users SET nickname = 'theirs' WHERE id = 1`)
+	if status, b := edit("users",
+		Change{Op: "delete", Key: map[string]*string{"id": s("5")}},
+		Change{Op: "update", Key: map[string]*string{"id": s("1"), "nickname": s("")}, Set: map[string]*string{"nickname": s("mine")}},
+	); status != 400 || !strings.Contains(b, "change 2: the row was changed") || !strings.Contains(users(), "1|theirs|0") || !strings.Contains(users(), "5|") {
+		t.Errorf("conflict: %d %s %s", status, b, users())
+	}
+
+	// No primary key, views and unknown columns are refused.
+	if status, b := edit("logs", Change{Op: "delete", Key: map[string]*string{"msg": s("boot")}}); status != 400 {
+		t.Errorf("no key: %d %s", status, b)
+	}
+	if status, b := edit("active_users", Change{Op: "delete", Key: map[string]*string{"id": s("1")}}); status != 400 {
+		t.Errorf("view: %d %s", status, b)
+	}
+	if status, b := edit("users", Change{Op: "update", Key: map[string]*string{"id": s("1")}, Set: map[string]*string{"nope": s("9")}}); status != 422 {
+		t.Errorf("unknown column: %d %s", status, b)
 	}
 }

@@ -103,6 +103,7 @@ td.on { background: var(--sel); }
 
 dialog { border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); width: min(420px, 92vw); }
 dialog label { display: grid; grid-template-columns: 90px 1fr; align-items: center; margin-bottom: 6px; }
+dialog fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 #dlgMsg { min-height: 1.4em; margin: 6px 0; white-space: pre-wrap; }
 #dlgMsg.err { color: var(--danger); }
 

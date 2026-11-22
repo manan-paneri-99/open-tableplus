@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type App struct {
@@ -22,7 +21,7 @@ type App struct {
 	pools *Pools
 }
 
-func NewApp(s *Store) *App { return &App{store: s, pools: &Pools{m: map[string]*pgxpool.Pool{}}} }
+func NewApp(s *Store) *App { return &App{store: s, pools: &Pools{m: map[string]Engine{}}} }
 
 func (a *App) routes() http.Handler {
 	web, _ := fs.Sub(webFS, "web")
@@ -57,28 +56,31 @@ func (a *App) routes() http.Handler {
 		}
 		reply(w, r, map[string]string{"version": v}, err)
 	})
-	mux.HandleFunc("GET /api/c/{id}/dbs", a.withPool(func(ctx context.Context, p *pgxpool.Pool, r *http.Request) (any, error) {
-		return Databases(ctx, p)
+	mux.HandleFunc("GET /api/c/{id}/dbs", a.withEngine(func(ctx context.Context, e Engine, r *http.Request) (any, error) {
+		return e.Databases(ctx)
 	}))
-	mux.HandleFunc("GET /api/c/{id}/{db}/tree", a.withPool(func(ctx context.Context, p *pgxpool.Pool, r *http.Request) (any, error) {
-		return Tree(ctx, p)
+	mux.HandleFunc("GET /api/c/{id}/{db}/tree", a.withEngine(func(ctx context.Context, e Engine, r *http.Request) (any, error) {
+		return e.Tree(ctx)
 	}))
-	mux.HandleFunc("GET /api/c/{id}/{db}/structure", a.withPool(func(ctx context.Context, p *pgxpool.Pool, r *http.Request) (any, error) {
-		return Structure(ctx, p, r.FormValue("schema"), r.FormValue("table"))
+	mux.HandleFunc("GET /api/c/{id}/{db}/structure", a.withEngine(func(ctx context.Context, e Engine, r *http.Request) (any, error) {
+		return e.Structure(ctx, r.FormValue("schema"), r.FormValue("table"))
 	}))
-	mux.HandleFunc("POST /api/c/{id}/{db}/rows", a.withPool(func(ctx context.Context, p *pgxpool.Pool, r *http.Request) (any, error) {
+	mux.HandleFunc("POST /api/c/{id}/{db}/rows", a.withEngine(func(ctx context.Context, e Engine, r *http.Request) (any, error) {
 		var req RowsReq
 		if err := readJSON(r, &req); err != nil {
 			return nil, err
 		}
-		return Rows(ctx, p, req)
+		if req.Page < 0 || req.Page > 1_000_000 {
+			return nil, userErr("bad page")
+		}
+		return e.Rows(ctx, req)
 	}))
-	mux.HandleFunc("POST /api/c/{id}/{db}/sql", a.withPool(func(ctx context.Context, p *pgxpool.Pool, r *http.Request) (any, error) {
+	mux.HandleFunc("POST /api/c/{id}/{db}/sql", a.withEngine(func(ctx context.Context, e Engine, r *http.Request) (any, error) {
 		var req struct{ SQL string }
 		if err := readJSON(r, &req); err != nil {
 			return nil, err
 		}
-		res, err := RunSQL(ctx, p, req.SQL)
+		res, err := e.RunSQL(ctx, req.SQL)
 		if sql := strings.TrimSpace(req.SQL); sql != "" && r.Context().Err() == nil { // cancelled runs aren't history
 			e := HistoryEntry{SQL: sql, At: time.Now().UnixMilli(), OK: err == nil, Info: "error"}
 			var pe *pgconn.PgError
@@ -91,7 +93,7 @@ func (a *App) routes() http.Handler {
 		}
 		return res, err
 	}))
-	mux.HandleFunc("POST /api/c/{id}/{db}/edit", a.withPool(func(ctx context.Context, p *pgxpool.Pool, r *http.Request) (any, error) {
+	mux.HandleFunc("POST /api/c/{id}/{db}/edit", a.withEngine(func(ctx context.Context, e Engine, r *http.Request) (any, error) {
 		var req EditReq
 		if c, _ := a.store.Get(r.PathValue("id")); !c.Editable {
 			return nil, userErr("editing is off for this connection: turn on \"Allow editing\" in its settings")
@@ -99,7 +101,7 @@ func (a *App) routes() http.Handler {
 		if err := readJSON(r, &req); err != nil {
 			return nil, err
 		}
-		return map[string]int{"applied": len(req.Changes)}, Edit(ctx, p, req)
+		return map[string]int{"applied": len(req.Changes)}, e.Edit(ctx, req)
 	}))
 	mux.HandleFunc("GET /api/c/{id}/{db}/history", func(w http.ResponseWriter, r *http.Request) {
 		reply(w, r, a.store.History(r.PathValue("id")+"/"+r.PathValue("db")), nil)
@@ -107,7 +109,7 @@ func (a *App) routes() http.Handler {
 	// Export is a form POST so the browser streams the response to a file.
 	mux.HandleFunc("POST /api/c/{id}/{db}/export", func(w http.ResponseWriter, r *http.Request) {
 		var req ExportReq
-		pool, err := a.pool(r)
+		eng, err := a.engine(r)
 		if err == nil && json.Unmarshal([]byte(r.FormValue("req")), &req) != nil {
 			err = userErr("bad request body")
 		}
@@ -118,7 +120,7 @@ func (a *App) routes() http.Handler {
 		ctx, cancel := context.WithTimeout(r.Context(), exportTimeout)
 		defer cancel()
 		started := false
-		err = Export(ctx, pool, req, func() io.Writer {
+		err = eng.Export(ctx, req, func() io.Writer {
 			started = true
 			name := "query"
 			if req.SQL == "" {
@@ -141,8 +143,8 @@ func (a *App) routes() http.Handler {
 
 var unsafeFilename = regexp.MustCompile(`[^A-Za-z0-9_.-]`)
 
-// pool resolves the URL's connection (and database, if any) to its pool.
-func (a *App) pool(r *http.Request) (*pgxpool.Pool, error) {
+// engine resolves the URL's connection (and database, if any) to its engine.
+func (a *App) engine(r *http.Request) (Engine, error) {
 	c, ok := a.store.Get(r.PathValue("id"))
 	if !ok {
 		return nil, notFound("connection")
@@ -154,18 +156,18 @@ func (a *App) pool(r *http.Request) (*pgxpool.Pool, error) {
 	return a.pools.Get(c, db)
 }
 
-// withPool runs fn on the URL's pool under the request timeout. A client
-// abort cancels ctx, which cancels the query in Postgres.
-func (a *App) withPool(fn func(context.Context, *pgxpool.Pool, *http.Request) (any, error)) http.HandlerFunc {
+// withEngine runs fn on the URL's engine under the request timeout. A client
+// abort cancels ctx, which cancels the query in the database.
+func (a *App) withEngine(fn func(context.Context, Engine, *http.Request) (any, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		pool, err := a.pool(r)
+		eng, err := a.engine(r)
 		if err != nil {
 			reply(w, r, nil, err)
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 		defer cancel()
-		v, err := fn(ctx, pool, r)
+		v, err := fn(ctx, eng, r)
 		reply(w, r, v, err)
 	}
 }
@@ -203,10 +205,13 @@ func reply(w http.ResponseWriter, r *http.Request, v any, err error) {
 	}
 	body, status := apiError{Error: err.Error()}, http.StatusBadGateway // default: couldn't reach/use the database
 	var pe *pgconn.PgError
+	var le liteErr
 	var ue userErr
 	switch {
 	case errors.As(err, &pe):
 		body = apiError{Error: pe.Message, Code: pe.Code, Detail: pe.Detail, Hint: pe.Hint, Position: pe.Position}
+		status = http.StatusUnprocessableEntity
+	case errors.As(err, &le):
 		status = http.StatusUnprocessableEntity
 	case errors.As(err, &ue):
 		status = http.StatusBadRequest
