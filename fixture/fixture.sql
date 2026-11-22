@@ -58,4 +58,6 @@ ANALYZE;
 \connect fixture_b
 CREATE TABLE public.orders (id int PRIMARY KEY, item text, qty int);
 INSERT INTO public.orders VALUES (1, 'apple', 3), (2, 'pear', 0), (3, 'fig', NULL);
+-- Edited by TestEdit, which resets it first.
+CREATE TABLE public.notes (id int PRIMARY KEY, body text, n int, done boolean DEFAULT false, at timestamptz DEFAULT '2026-01-01');
 ANALYZE;

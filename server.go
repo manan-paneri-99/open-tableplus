@@ -91,6 +91,16 @@ func (a *App) routes() http.Handler {
 		}
 		return res, err
 	}))
+	mux.HandleFunc("POST /api/c/{id}/{db}/edit", a.withPool(func(ctx context.Context, p *pgxpool.Pool, r *http.Request) (any, error) {
+		var req EditReq
+		if c, _ := a.store.Get(r.PathValue("id")); !c.Editable {
+			return nil, userErr("editing is off for this connection: turn on \"Allow editing\" in its settings")
+		}
+		if err := readJSON(r, &req); err != nil {
+			return nil, err
+		}
+		return map[string]int{"applied": len(req.Changes)}, Edit(ctx, p, req)
+	}))
 	mux.HandleFunc("GET /api/c/{id}/{db}/history", func(w http.ResponseWriter, r *http.Request) {
 		reply(w, r, a.store.History(r.PathValue("id")+"/"+r.PathValue("db")), nil)
 	})

@@ -691,3 +691,89 @@ func TestHistory(t *testing.T) {
 		t.Error("history.json still mentions the deleted connection")
 	}
 }
+
+func TestEdit(t *testing.T) {
+	e := setup(t)
+	psql(t, "fixture_b", `TRUNCATE public.notes; INSERT INTO public.notes VALUES (1, 'a', 1, true), (2, 'b', 2, false), (3, 'c', 3, NULL)`)
+	notes := func() string {
+		return psql(t, "fixture_b", `SELECT string_agg(concat_ws('|', id, coalesce(body, 'NULL'), coalesce(n::text, 'NULL'), coalesce(done::text, 'NULL'), at::date), ' ' ORDER BY id) FROM public.notes`)
+	}
+	s := func(v string) *string { return &v }
+	edit := func(table string, ch ...Change) (int, string) {
+		status, b, err := e.call(context.Background(), "POST", "/api/c/"+e.conn+"/fixture_b/edit", EditReq{Schema: "public", Table: table, Changes: ch})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return status, string(b)
+	}
+	before := notes()
+
+	// Off by default.
+	if status, b := edit("notes", Change{Op: "delete", Key: map[string]*string{"id": s("1")}}); status != 400 || !strings.Contains(b, "editing is off") {
+		t.Fatalf("edit without opt-in: %d %s", status, b)
+	}
+	var c ConnView
+	e.must("PUT", "/api/conns", Conn{ID: e.conn, Name: "fixture", Host: "127.0.0.1", Port: devPort, User: "postgres", Database: "fixture_a", SSLMode: "disable", Editable: true}, &c)
+	if !c.Editable {
+		t.Fatal("editable not saved")
+	}
+	// The SQL box stays read-only.
+	if status, _, _ := e.sql("DELETE FROM public.logs"); status == 200 {
+		t.Error("SQL box wrote with editing on")
+	}
+
+	// Update (only the chosen row and column), insert with defaults, delete; NULL, '', 0 and false stay distinct.
+	status, b := edit("notes",
+		Change{Op: "update", Key: map[string]*string{"id": s("1"), "body": s("a")}, Set: map[string]*string{"body": s(""), "n": s("0")}},
+		Change{Op: "update", Key: map[string]*string{"id": s("2"), "done": s("false")}, Set: map[string]*string{"body": nil}},
+		Change{Op: "insert", Set: map[string]*string{"id": s("4"), "done": s("false")}},
+		Change{Op: "delete", Key: map[string]*string{"id": s("3"), "body": s("c"), "n": s("3"), "done": nil}},
+	)
+	if want := "1||0|true|2026-01-01 2|NULL|2|false|2026-01-01 4|NULL|NULL|false|2026-01-01"; status != 200 || notes() != want {
+		t.Fatalf("apply: %d %s\n got %s\nwant %s", status, b, notes(), want)
+	}
+	before = notes()
+
+	// All or nothing: a bad value in the last change rolls back the first two.
+	if status, b := edit("notes",
+		Change{Op: "update", Key: map[string]*string{"id": s("1")}, Set: map[string]*string{"body": s("x")}},
+		Change{Op: "delete", Key: map[string]*string{"id": s("2")}},
+		Change{Op: "update", Key: map[string]*string{"id": s("4")}, Set: map[string]*string{"n": s("not a number")}},
+	); status != 422 || notes() != before {
+		t.Errorf("partial apply: %d %s %s", status, b, notes())
+	}
+
+	// A concurrent change wins: the stale edit matches nothing and nothing is applied.
+	psql(t, "fixture_b", `UPDATE public.notes SET body = 'theirs' WHERE id = 1`)
+	if status, b := edit("notes",
+		Change{Op: "delete", Key: map[string]*string{"id": s("4")}},
+		Change{Op: "update", Key: map[string]*string{"id": s("1"), "body": s("")}, Set: map[string]*string{"body": s("mine")}},
+	); status != 400 || !strings.Contains(b, "change 2: the row was changed or deleted") ||
+		psql(t, "fixture_b", `SELECT body FROM public.notes WHERE id = 1`) != "theirs" || !strings.Contains(notes(), "4|") {
+		t.Errorf("conflict: %d %s %s", status, b, notes())
+	}
+
+	// No primary key, views, keyless changes, bad ops and unknown columns are refused.
+	for _, tc := range []struct {
+		table string
+		ch    Change
+	}{
+		{"logs", Change{Op: "delete", Key: map[string]*string{"msg": s("boot")}}},
+		{"notes", Change{Op: "update", Key: map[string]*string{"body": s("theirs")}, Set: map[string]*string{"n": s("9")}}},
+		{"notes", Change{Op: "insert", Key: map[string]*string{"id": s("1")}}},
+		{"notes", Change{Op: "drop", Key: map[string]*string{"id": s("1")}}},
+	} {
+		if status, b := edit(tc.table, tc.ch); status != 400 {
+			t.Errorf("%s %+v: %d %s", tc.table, tc.ch, status, b)
+		}
+	}
+	if status, b := edit("notes", Change{Op: "update", Key: map[string]*string{"id": s("1")}, Set: map[string]*string{"nope": s("9")}}); status != 422 || !strings.Contains(b, "42703") {
+		t.Errorf("unknown column: %d %s", status, b)
+	}
+	if status, _, err := e.call(context.Background(), "POST", "/api/c/"+e.conn+"/fixture_a/edit", EditReq{Schema: "app", Table: "active_users", Changes: []Change{{Op: "delete", Key: map[string]*string{"id": s("1")}}}}); err != nil || status != 400 {
+		t.Errorf("view edit: %d %v", status, err)
+	}
+	if psql(t, "fixture_b", `SELECT count(*) FROM public.notes`) != "3" {
+		t.Errorf("refused edits changed rows: %s", notes())
+	}
+}

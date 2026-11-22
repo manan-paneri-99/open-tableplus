@@ -61,6 +61,8 @@ button.wide { width: 100%; }
 .structure { flex: 1; overflow: auto; }
 .structure h3 { font-size: 13px; margin: 12px 0 4px; }
 .structure table { border: 1px solid var(--line); }
+.review { display: flex; flex-direction: column; gap: 3px; max-height: 25vh; overflow: auto; border: 1px solid var(--pending); border-radius: 5px; padding: 6px; }
+.review code { font-size: 12px; white-space: pre-wrap; word-break: break-all; }
 .history { display: flex; flex-direction: column; max-height: 30vh; overflow: auto; border: 1px solid var(--line); border-radius: 5px; }
 .history button { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: none; text-align: left; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
 .history button:hover { background: var(--line); }
@@ -85,8 +87,19 @@ th small { display: block; font-weight: 400; color: var(--muted); }
 td.num { text-align: right; }
 td.null { color: var(--muted); font-style: italic; }
 td.cut::after { content: " …"; color: var(--pending); }
+td.dirty, tr.ch-insert td { background: color-mix(in srgb, var(--pending) 22%, transparent); }
+tr.ch-delete td { text-decoration: line-through; opacity: .55; }
 td.on { background: var(--sel); }
-.cell { margin: 0; max-height: 30vh; overflow: auto; padding: 8px; background: var(--panel); border-radius: 5px; white-space: pre-wrap; word-break: break-all; font-size: 12px; }
+.body { flex: 1; display: flex; min-height: 0; }
+.grip { width: 6px; flex-shrink: 0; cursor: col-resize; } .grip:hover { background: var(--accent); } .grip:has(+ [hidden]) { display: none; }
+.body > .grid, .body > .structure { flex: 1; min-width: 0; }
+.side { width: var(--side, 340px); flex-shrink: 0; overflow: auto; display: flex; flex-direction: column; gap: 8px; padding: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 5px; }
+.side .field { display: flex; flex-direction: column; gap: 2px; }
+.side .field.on b { color: var(--accent); }
+.side small { color: var(--muted); }
+.side .field button { padding: 0 5px; font-size: 11px; }
+.side textarea { width: 100%; resize: vertical; field-sizing: content; max-height: 40vh; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+.side textarea[readonly] { background: var(--panel); }
 
 dialog { border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); width: min(420px, 92vw); }
 dialog label { display: grid; grid-template-columns: 90px 1fr; align-items: center; margin-bottom: 6px; }
@@ -96,4 +109,5 @@ dialog label { display: grid; grid-template-columns: 90px 1fr; align-items: cent
 @media (max-width: 700px) {
   body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; height: auto; min-height: 100vh; }
   #tree { max-height: 30vh; }
+  .body { flex-direction: column; } .side { width: auto; } .grip { display: none; }
 }
