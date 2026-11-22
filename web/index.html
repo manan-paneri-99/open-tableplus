@@ -32,16 +32,26 @@
     <form id="connForm" method="dialog">
       <h2>Connection</h2>
       <label>Name <input name="name" required></label>
-      <label>Host <input name="host" required value="127.0.0.1"></label>
-      <label>Port <input name="port" type="number" min="1" max="65535" value="5432"></label>
-      <label>User <input name="user" autocomplete="off"></label>
-      <label>Password <input name="password" type="password" autocomplete="new-password" placeholder="blank = keep saved / use ~/.pgpass"></label>
-      <label>Database <input name="database" value="postgres"></label>
-      <label>SSL mode
-        <select name="sslmode">
-          <option>prefer</option><option>disable</option><option>require</option><option>verify-full</option>
+      <label>Type
+        <select name="engine">
+          <option value="">PostgreSQL</option><option value="sqlite">SQLite</option>
         </select>
       </label>
+      <fieldset id="pgFields">
+        <label>Host <input name="host" required value="127.0.0.1"></label>
+        <label>Port <input name="port" type="number" min="1" max="65535" value="5432"></label>
+        <label>User <input name="user" autocomplete="off"></label>
+        <label>Password <input name="password" type="password" autocomplete="new-password" placeholder="blank = keep saved / use ~/.pgpass"></label>
+        <label>Database <input name="database" value="postgres"></label>
+        <label>SSL mode
+          <select name="sslmode">
+            <option>prefer</option><option>disable</option><option>require</option><option>verify-full</option>
+          </select>
+        </label>
+      </fieldset>
+      <fieldset id="liteFields">
+        <label>File <input name="path" required placeholder="/full/path/to/file.db" spellcheck="false"></label>
+      </fieldset>
       <label>Environment
         <select name="env">
           <option value="">none</option><option>dev</option><option>staging</option><option>prod</option>

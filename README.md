@@ -1,6 +1,6 @@
 # Open TablePlus
 
-A local web UI for browsing and searching PostgreSQL databases: read-only unless you turn on editing for a connection. One Go binary, one dependency (`pgx`), no build step for the UI.
+A local web UI for browsing and searching PostgreSQL databases and SQLite files: read-only unless you turn on editing for a connection. One Go binary, three dependencies (`pgx`, `go-sqlite3` and `go-keyring`, all pure Go), no build step for the UI.
 
 ## Install (no Go needed)
 
@@ -31,12 +31,15 @@ Optionally back up first: `cp -R ~/.config/open-tableplus ~/.config/open-tablepl
 
 | Data | Where | Kept across upgrades |
 |---|---|---|
-| Connections, passwords, environment and editing settings | `~/.config/open-tableplus/connections.json` | yes |
+| Connections, environment and editing settings | `~/.config/open-tableplus/connections.json` | yes |
+| Passwords (v0.5+) | the OS keychain, under `open-tableplus` | yes |
 | Query history (v0.3+) | `~/.config/open-tableplus/history.json` | yes |
 | Access token | `~/.config/open-tableplus/token` | yes, so you stay signed in |
 | Open tabs and editor text | browser storage for `http://127.0.0.1:7777` | yes, if you keep the same port |
 
 Newer versions read older files, and older versions ignore fields they don't know. If a release ever changes the file format, it will convert the files on first start and say so in the release notes.
+
+v0.5 moves saved passwords out of `connections.json` into the OS keychain on first start. Going back to an older version after that loses them (re-enter them in each connection).
 
 ## Build from source
 
@@ -45,9 +48,11 @@ go build -o open-tableplus . && ./open-tableplus
 scripts/release.sh v0.1.0   # all platforms → dist/, with SHA256SUMS
 ```
 
-Connections and query history are saved in `~/.config/open-tableplus/` (`connections.json`, `history.json`, both mode 0600). Leave the password blank to use `~/.pgpass`.
+Connections and query history are saved in `~/.config/open-tableplus/` (`connections.json`, `history.json`, both mode 0600). Passwords go in the OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service). If there's no usable keychain, as on a headless Linux box, the password stays in the 0600 file and the log says so. Leave the password blank to use `~/.pgpass`.
 
-Every query runs inside a `READ ONLY` transaction, so Postgres refuses writes. The one exception is grid editing (v0.4), below. For production databases you only browse, also connect with a read-only role.
+Every Postgres query runs inside a `READ ONLY` transaction, so Postgres refuses writes. SQLite files are opened read-only, so SQLite refuses them. The SQL box runs one statement at a time. The one exception is grid editing (v0.4), below. For production databases you only browse, also connect with a read-only role.
+
+For a SQLite file, choose **SQLite** as the connection type and type the file's full path. The file must already exist. Its tables are under `main`. SQLite keeps no row estimates, so the sidebar shows no counts.
 
 ## Editing (v0.4)
 
@@ -79,7 +84,7 @@ Docs:
 
 ## Roadmap
 
-Read-only and reliable first, then writes, then reach. App code (excluding tests) is kept small: about 2,100 lines at v0.4. Each release ends with an audit that removes code that isn't earning its place.
+Read-only and reliable first, then writes, then reach. App code (excluding tests) is kept small: about 2,100 lines at v0.4, about 2,600 at v0.5. Each release ends with an audit that removes code that isn't earning its place.
 
 **Shipped**
 - **v0.1:** browse and search Postgres, multiple connections and databases, a read-only SQL box with cancel, and a single binary for macOS, Windows and Linux.
@@ -92,20 +97,23 @@ Read-only and reliable first, then writes, then reach. App code (excluding tests
   - Environment label per connection (a red `prod` badge and coloured tabs).
   - Structure view: columns, indexes and foreign keys.
 
-**In review (PR #4)**
-- **v0.4: Safe editing,** opt-in per connection.
+- **v0.4: Safe editing,** opt-in per connection (merged; not yet tagged).
   - Edit, insert and delete rows in tables that have a primary key.
   - Review pending changes before applying.
   - Apply in one transaction with conflict detection.
   - Extra confirmation on `prod`.
 
+**In progress**
+- **v0.5: Keychain and SQLite.**
+  - Passwords saved in the OS keychain instead of `connections.json`.
+  - SQLite files: everything Postgres connections can do, editing included.
+
 **Next**
-- **v0.5: Reach real servers.**
+- **Reach real servers.**
   - SSH tunnels through a bastion host.
   - TLS CA and client certificates.
   - Reconnect behaviour covered by tests.
-  - Passwords saved in the OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service) instead of `connections.json`.
 
-**Later:** MySQL and SQLite (the API and UI are already engine-neutral; Postgres code lives in `db.go`), signed and notarized binaries plus Homebrew/winget, SQL syntax highlighting, ER diagrams.
+**Later:** MySQL (Postgres lives in `db.go` and SQLite in `sqlite.go`, behind one `Engine` interface), signed and notarized binaries plus Homebrew/winget, SQL syntax highlighting, ER diagrams.
 
 **Not planned:** hosted or multi-user mode, AI features.

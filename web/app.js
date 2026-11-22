@@ -297,7 +297,7 @@ async function loadRows(tab) {
   }
 }
 
-const numeric = /^(smallint|integer|bigint|numeric|real|double precision|money|oid)\b/;
+const numeric = /^(smallint|integer|bigint|numeric|real|double precision|money|oid)\b/i; // i: SQLite declares INTEGER, REAL…
 
 // renderGrid shows a result in the tab's main grid, where cells can be selected
 // and copied (and edited). Redrawing the same result keeps scroll and selection.
@@ -630,18 +630,28 @@ function openDialog(conn) {
   editing = conn;
   const f = $('#connForm');
   f.reset();
-  for (const k of ['name', 'host', 'port', 'user', 'database', 'sslmode', 'env']) if (conn) f.elements[k].value = conn[k] ?? '';
+  for (const k of ['name', 'engine', 'path', 'host', 'port', 'user', 'database', 'sslmode', 'env']) if (conn) f.elements[k].value = conn[k] ?? '';
   f.elements.editable.checked = !!conn?.editable;
+  showEngine();
   f.elements.password.placeholder = conn?.hasPassword ? 'saved — leave blank to keep' : 'blank = use ~/.pgpass';
   $('#dlgDelete').hidden = !conn;
   dlgMsg('');
   $('#connDlg').showModal();
 }
 
+// Only the chosen engine's fields show; a disabled fieldset is skipped by form validation.
+function showEngine() {
+  const lite = $('#connForm').elements.engine.value === 'sqlite';
+  $('#pgFields').hidden = $('#pgFields').disabled = lite;
+  $('#liteFields').hidden = $('#liteFields').disabled = !lite;
+}
+$('#connForm').elements.engine.onchange = showEngine;
+
 function dlgMsg(msg, err) { const el = $('#dlgMsg'); el.textContent = msg; el.className = err ? 'err' : ''; }
 
 function formConn() {
   const f = $('#connForm').elements;
+  if (f.engine.value === 'sqlite') return { id: editing?.id || '', name: f.name.value.trim(), engine: 'sqlite', path: f.path.value.trim(), env: f.env.value, editable: f.editable.checked };
   return {
     id: editing?.id || '', name: f.name.value.trim(), host: f.host.value.trim(), port: Number(f.port.value) || 5432,
     user: f.user.value.trim(), password: f.password.value, database: f.database.value.trim() || 'postgres', sslmode: f.sslmode.value, env: f.env.value, editable: f.editable.checked,
@@ -650,7 +660,7 @@ function formConn() {
 
 $('#dlgTest').onclick = async () => {
   dlgMsg('Testing…');
-  try { const r = await api('POST', '/conns/test', formConn()); dlgMsg(`Connected. PostgreSQL ${r.version}`); }
+  try { const r = await api('POST', '/conns/test', formConn()); dlgMsg(`Connected. ${r.version}`); }
   catch (e) { dlgMsg(errText(e), true); }
 };
 
