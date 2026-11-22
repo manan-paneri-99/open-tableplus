@@ -78,7 +78,8 @@ scripts/devdb.sh reset      # wipe and reseed
 Docs:
 - [docs/STATUS.md](docs/STATUS.md): current state, decisions, next steps.
 - [docs/v1-plan.md](docs/v1-plan.md): architecture and API.
-- [docs/v0.4-plan.md](docs/v0.4-plan.md): current release spec (editing).
+- [docs/v0.4-plan.md](docs/v0.4-plan.md): v0.4 spec (editing).
+- [docs/v0.5-plan.md](docs/v0.5-plan.md): v0.5 spec (keychain and SQLite).
 - [docs/v0.3-plan.md](docs/v0.3-plan.md): the v0.3 spec.
 - [docs/product-spec.md](docs/product-spec.md): the original vision.
 
@@ -97,13 +98,13 @@ Read-only and reliable first, then writes, then reach. App code (excluding tests
   - Environment label per connection (a red `prod` badge and coloured tabs).
   - Structure view: columns, indexes and foreign keys.
 
-- **v0.4: Safe editing,** opt-in per connection (merged; not yet tagged).
+- **v0.4: Safe editing,** opt-in per connection.
   - Edit, insert and delete rows in tables that have a primary key.
   - Review pending changes before applying.
   - Apply in one transaction with conflict detection.
   - Extra confirmation on `prod`.
 
-**In progress**
+**Merged, not yet released**
 - **v0.5: Keychain and SQLite.**
   - Passwords saved in the OS keychain instead of `connections.json`.
   - SQLite files: everything Postgres connections can do, editing included.

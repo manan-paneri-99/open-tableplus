@@ -5,13 +5,14 @@
 ## Where things stand
 
 - **Repo:** https://github.com/manan-paneri-99/open-tableplus (public). The local folder is still named `apna-tableplus`; the product name is open-tableplus everywhere else.
-- **`main`** = v0.4 (PR #4 merged 22 November 2026), **not tagged yet**: tag `v0.4.0` only when the user says so. The latest release is still **v0.3.0**.
+- **`main`** = v0.5 (PR #5 merged 22 November 2026), **not tagged yet**: tag `v0.5.0` only when the user says so. The latest release is **v0.4.0**, tagged on the PR #4 merge commit `ad4e41e`.
 - **Releases:**
+  - v0.4.0 (22 November 2026): safe editing, opt-in per connection, with a row side panel.
   - v0.3.0: copy as TSV, streamed CSV export, server-side query history, environment labels, structure view.
   - v0.2.1: pooled sessions are reset with `DISCARD ALL`; README roadmap.
   - v0.2.0: tabs, and search/filters run on Enter.
   - v0.1.0: marked pre-release; it crashes on filters that match no rows.
-- **In progress: v0.5**, branch `v0.5-keychain-sqlite` (`docs/v0.5-plan.md`): passwords in the OS keychain, and SQLite with full parity including editing. SSH/TLS is deferred.
+- **v0.5 is on `main`** (`docs/v0.5-plan.md`): passwords in the OS keychain, and SQLite with full parity including editing. SSH/TLS is deferred.
 - **Size:** app code (`*.go` excluding tests, plus `web/`) is **2,579 lines** at v0.5 (v0.4 was 2,133; v0.3.0 was 1,854). The user set no budget for v0.5: "keep the code lean". Tests are about 1,050 lines. Binaries grew by about 5 MB (11 → 16 MB on darwin/arm64), mostly SQLite's wasm runtime.
 
 ## How to work on it
@@ -46,7 +47,7 @@ See `CLAUDE.md` for commands and conventions. The release flow:
 ## Gaps vs the original `product-spec.md`
 
 - **Phase 1 (read-only explorer):** complete once v0.3 merges, except **syntax highlighting**.
-- **Phase 2 (safe editing):** merged (v0.4), including a row side panel for copying and editing a row; not tagged yet.
+- **Phase 2 (safe editing):** released in v0.4.0, including a row side panel for copying and editing a row.
 - **Phase 3 (polish):** missing **saved queries** and a **diagnostics view**.
 - **Phase 4:** SQLite is v0.5; SSH/TLS comes next; MySQL is "Later"; import, backup and ER diagrams are not planned.
 - **Non-functional requirements:**
@@ -79,6 +80,5 @@ See `CLAUDE.md` for commands and conventions. The release flow:
 
 ## Next steps
 
-1. **v0.4.0:** merged into `main`; tag it when the user says so.
-2. **v0.5, keychain + SQLite:** built on `v0.5-keychain-sqlite` (`docs/v0.5-plan.md`). Open a PR, let CI run, and get the user's review. Deferred: what to do on Linux with no Secret Service (currently, keep the password in the 0600 file with a warning). Then SSH tunnels and TLS certificates.
-3. **Later:** syntax highlighting, saved queries, grid keyboard navigation, Firefox/Safari checks, signed binaries and Homebrew, and MySQL.
+1. **v0.5.0, keychain + SQLite:** merged into `main` (`docs/v0.5-plan.md`); tag it when the user says so. Deferred: what to do on Linux with no Secret Service (currently, keep the password in the 0600 file with a warning). Then SSH tunnels and TLS certificates.
+2. **Later:** syntax highlighting, saved queries, grid keyboard navigation, Firefox/Safari checks, signed binaries and Homebrew, and MySQL.
